@@ -204,6 +204,7 @@ void fdb_gather_stale_blocks(fdb_kvs_handle *handle,
                              struct list_elem *e_last,
                              bool from_mergetree)
 {
+    assert(0);
     int64_t delta;
     int r;
     uint32_t count = 0;
@@ -379,9 +380,8 @@ void fdb_gather_stale_blocks(fdb_kvs_handle *handle,
 
                 // insert into stale-block tree
                 _doc_offset = _endian_encode(doc_offset);
-                btree_insert(handle->staletree, (void *)&_revnum, (void *)&_doc_offset);
+                //btree_insert(handle->staletree, (void *)&_revnum, (void *)&_doc_offset);
                 btreeblk_end(handle->bhandle);
-                btreeblk_reset_subblock_info(handle->bhandle);
 
                 if (from_mergetree && first_loop) {
                     // if from_mergetree flag is set and this is the first loop,
@@ -427,7 +427,6 @@ void fdb_gather_stale_blocks(fdb_kvs_handle *handle,
 
         free(buf);
     } else {
-        btreeblk_reset_subblock_info(handle->bhandle);
     }
 }
 
@@ -983,10 +982,15 @@ void fdb_rollback_stale_blocks(fdb_kvs_handle *handle,
     // remove from on-disk stale-tree
     for (i = handle->rollback_revnum; i < cur_revnum; ++i) {
         _revnum = _endian_encode(i);
-        br = btree_remove(handle->staletree, (void*)&_revnum);
-        // don't care the result
-        (void)br;
-        btreeblk_end(handle->bhandle);
+        if(handle->file->config->kvssd) {
+            // TDB. Don't think we need this as we don't use a tree for 
+            // stale data. Tree seems to only be used for block reuse.
+        } else {
+            br = btree_remove(handle->staletree, (void*)&_revnum);
+            // don't care the result
+            (void)br;
+            btreeblk_end(handle->bhandle);
+        }
     }
 
     // also remove from in-memory stale-tree

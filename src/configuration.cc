@@ -35,6 +35,8 @@ fdb_config get_default_config(void) {
     fconfig.buffercache_size = 134217728;
     // 4K WAL entries by default.
     fconfig.wal_threshold = 4096;
+    fconfig.max_log_threshold = 10;
+    fconfig.split_threshold = FDB_BLOCKSIZE;
     fconfig.wal_flush_before_commit = true;
     fconfig.auto_commit = false;
     // 0 second by default.
@@ -119,6 +121,186 @@ fdb_config get_default_config(void) {
 
     // Document blocks are cached by default.
     fconfig.do_not_cache_doc_blocks = false;
+    
+    // Block SSD by default
+    fconfig.kvssd = false;
+	fconfig.logging = false;
+	fconfig.max_log_threshold = -1;
+	fconfig.split_threshold = FDB_BLOCKSIZE;
+    
+    fconfig.kvssd_emu_config_file = NULL;
+    fconfig.kvssd_dev_path = (char*) "/dev/kvemul";;
+
+    // Use the block cache by default.
+    fconfig.kv_cache_size = 0;
+    fconfig.kv_cache_doc_writes = false;
+    fconfig.kvssd_max_value_size = 0;
+    fconfig.background_wal_preload = false;
+    fconfig.wal_flush_preloading = false;
+    fconfig.max_logs_per_node = 5;
+    fconfig.num_aio_workers = 1;
+
+    return fconfig;
+}
+
+fdb_config get_default_config_kvssd(void) {
+    fdb_config fconfig;
+
+    fconfig.chunksize = sizeof(uint64_t);
+    // 4KB by default.
+    fconfig.blocksize = FDB_BLOCKSIZE;
+    fconfig.index_blocksize = FDB_BLOCKSIZE;
+    fconfig.split_threshold = FDB_BLOCKSIZE;
+    // 128MB by default.
+    fconfig.buffercache_size = (128 * 1024 * 1024) * .2;
+    // 4K WAL entries by default.
+    fconfig.wal_threshold = 4096;
+    fconfig.wal_flush_before_commit = false;
+    fconfig.auto_commit = false;
+    // 0 second by default.
+    fconfig.purging_interval = 0;
+    // Sequnce trees are disabled by default.
+    fconfig.seqtree_opt = FDB_SEQTREE_NOT_USE;
+    // Use a synchronous commit by default.
+    fconfig.durability_opt = FDB_DRB_NONE;
+    fconfig.flags = FDB_OPEN_FLAG_CREATE;
+    // 4MB by default.
+    fconfig.compaction_buf_maxsize = FDB_COMP_BUF_MINSIZE;
+    // Clean up cache entries when a file is closed.
+    fconfig.cleanup_cache_onclose = true;
+    // Compress the body of documents using snappy. Disabled by default.
+    fconfig.compress_document_body = false;
+    // Auto compaction is disabled by default
+    fconfig.compaction_mode = FDB_COMPACTION_MANUAL;
+    // Compaction threshold, 30% by default
+    fconfig.compaction_threshold = FDB_DEFAULT_COMPACTION_THRESHOLD;
+    fconfig.compaction_minimum_filesize = 1048576; // 1MB by default
+    // 8 hours by default
+    fconfig.compactor_sleep_duration = FDB_COMPACTOR_SLEEP_DURATION;
+    // Multi KV Instance mode is enabled by default
+    fconfig.multi_kv_instances = false;
+    // TODO: Re-enable this after prefetch ThreadSanitizer fixes are in..
+    fconfig.prefetch_duration = 0;
+
+    // Determine the number of WAL and buffer cache partitions by considering the
+    // number of cores available in the host environment.
+    int i = 0;
+    ssize_t num_cores = (ssize_t) get_num_cores();
+    for (; prime_size_table[i] > 0 && prime_size_table[i] < num_cores; ++i) {
+        // Finding the smallest prime number that is greater than the number of cores.
+    }
+    if (prime_size_table[i] == -1) {
+        fconfig.num_wal_partitions = prime_size_table[i-1];
+        fconfig.num_bcache_partitions = prime_size_table[i-1];
+    } else {
+        fconfig.num_wal_partitions = prime_size_table[i];
+        // For bcache partitions pick a higher value for smaller avl trees
+        fconfig.num_bcache_partitions = prime_size_table[i];
+    }
+
+    // No compaction callback function by default
+    fconfig.compaction_cb = NULL;
+    fconfig.compaction_cb_mask = 0x0;
+    fconfig.compaction_cb_ctx = NULL;
+    fconfig.max_writer_lock_prob = 100;
+    // 1 daemon compactor thread by default
+    fconfig.num_compactor_threads = 1;
+    fconfig.enable_background_compactor = true;
+    fconfig.num_bgflusher_threads = 1;
+    // Block reusing threshold, 0% by default as we don't use it on the KVSSD
+    fconfig.block_reusing_threshold = 0;
+    // Trigger block reuse after 16MB.
+    fconfig.min_block_reuse_filesize = SB_MIN_BLOCK_REUSING_FILESIZE;
+    // Unlimited cycle.
+    fconfig.max_block_reusing_cycle = 0;
+    // Keep at most 5 recent committed database snapshots
+    fconfig.num_keeping_headers = 5;
+
+    fconfig.encryption_key.algorithm = FDB_ENCRYPTION_NONE;
+    memset(fconfig.encryption_key.bytes, 0, sizeof(fconfig.encryption_key.bytes));
+
+    // Breakpad minidump directory, set to current working dir
+    fconfig.breakpad_minidump_dir = ".";
+
+    // Default log level: FATAL (1)
+    fconfig.log_msg_level = 1;
+
+    // Auto move to new file.
+    fconfig.do_not_move_to_compacted_file = false;
+
+    // Disable reserved blocks.
+    fconfig.enable_reusable_block_reservation = false;
+
+    // Disable bulk load mode.
+    fconfig.bulk_load_mode = false;
+
+    // WAL data should be visiable by default.
+    fconfig.do_not_search_wal = false;
+
+    // Document blocks are cached by default.
+    fconfig.do_not_cache_doc_blocks = false;
+    
+    // KVSSD by default
+    fconfig.kvssd = true;
+    fconfig.max_log_threshold = 250;
+    fconfig.split_threshold = FDB_BLOCKSIZE;
+
+	// Logging by default
+	fconfig.logging = true;
+
+    fconfig.kvssd_emu_config_file = 
+    (char*)"kvssd_emul.conf";
+
+#ifdef __RAN_KVEMU_DEV
+    /*
+     * When running the tests, we don't have a good way right now to reset the
+     * emulator after every test. Generate a random emulator device name here
+     * every time so each test runs on a new device. The user can overwrite this
+     * with their own device after this function returns, if necessary.
+     */
+
+    uint64_t rand_dev = rand();
+    char* buf = (char*) malloc(32);
+    memset(buf, 0x0, 32);
+    sprintf(buf, "/dev/%lu", rand_dev);
+    fconfig.kvssd_dev_path = buf;
+#else
+    fconfig.kvssd_dev_path = (char*) "/dev/kvemul";
+#endif
+    
+    // Use the block cache by default.
+    fconfig.kv_cache_size = (128 * 1024 * 1024) * .8;
+    fconfig.kv_cache_doc_writes = true;
+    fconfig.kvssd_max_value_size = 2097152;
+    fconfig.background_wal_preload = false;
+    fconfig.wal_flush_preloading = false;
+    fconfig.delete_during_wal_flush = false;
+
+    // trim the size of the OAK-Tree logs or not
+    // value in MB, 0 means don't trim
+    fconfig.log_trim_mb = 100;
+
+    // threshold in seconds for cold OAK-Tree
+    // log repacking, 0 means don't repack
+    fconfig.cold_log_threshold = 60;
+
+    // scan for old logs per N commits
+    fconfig.cold_log_scan_interval = 1;
+
+    // trim log after % of stale data
+    fconfig.log_trim_threshold = 10;
+
+    fconfig.write_index_on_close = true;
+
+    fconfig.max_logs_per_node = 5;
+
+    fconfig.num_aio_workers = 1;
+    fconfig.max_outstanding = 64;
+
+    // run deletion routine every N seconds
+    fconfig.deletion_interval = 1;
+    fconfig.async_wal_flushes = 0;
+    fconfig.kvssd_retrieve_length = 4096;
 
     return fconfig;
 }

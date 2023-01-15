@@ -20,23 +20,186 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <openssl/sha.h>
 #if !defined(WIN32) && !defined(_WIN32)
 #include <sys/time.h>
 #endif
 #include <time.h>
+#include <string>
+#include <map>
+#include <set>
+#include <algorithm>
 
 #include "filemgr.h"
 #include "filemgr_ops.h"
+#include "filemgr_ops_kvssd.h"
 #include "hash_functions.h"
 #include "blockcache.h"
+#include "timing.h"
 #include "wal.h"
 #include "list.h"
 #include "fdb_internal.h"
 #include "time_utils.h"
 #include "encryption.h"
 #include "version.h"
+#include "kv_data_cache.h"
+#include "btree_kv.h"
+#include "libforestdb/forestdb.h"
+#include "limits.h"
+#include "kvssdmgr.h"
 
 #include "memleak.h"
+
+uint32_t log_meta_length = 16 + TSTAMP_LENGTH;
+uint32_t log_entry_size = sizeof(uint64_t) + sizeof(uint64_t);
+
+uint32_t VALUE_RETRIEVE_LENGTH;
+uint32_t LOG_RETRIEVE_LENGTH;
+uint32_t MAX_ENTRIES_PER_LOG_WRITE;
+
+thread_local bool check_lat = 0;
+uint32_t MAX_OUTSTANDING_REQUESTS = 64;
+
+#ifdef __KVSSD_EMU
+static void _ioctx_free_func(kvs_postprocess_context* ioctx, bool free_key, bool free_val) {
+    if(free_key) {
+        if(ioctx->key && ioctx->key->key) free(ioctx->key->key);
+    }
+
+    if(free_val) {
+        if(ioctx->value && ioctx->value->value) free(ioctx->value->value);
+    }
+
+    if(ioctx->key) free(ioctx->key);
+    if(ioctx->value) free(ioctx->value);
+}
+#endif
+
+fdb_status _delete(struct filemgr *file, key *k, 
+                   struct callback_args *cb) {
+    fdb_status ret = file->ops_kvssd->del(k, cb);
+    if(!cb) {
+        //delete k;
+    }
+    return ret;
+}
+
+fdb_status del(struct filemgr *file, std::string str, 
+            struct callback_args *cb) {
+    key *k = new str_key(str);
+    return _delete(file, k, cb);
+}
+
+fdb_status del(struct filemgr *file, uint64_t vernum,
+            struct callback_args *cb) {
+    key *k = new vnum_key(vernum);
+    return _delete(file, k, cb);
+}
+
+fdb_status del(struct filemgr *file, uint64_t vernum, 
+            uint32_t log_num, struct callback_args *cb) {
+    key *k = new log_key(vernum, log_num);
+    return _delete(file, k, cb);
+}
+
+ssize_t _store(struct filemgr *file, key *k, 
+               void *buf, uint32_t vlen, struct callback_args *cb) {
+    ssize_t ret = file->ops_kvssd->store(k, buf, vlen, cb);
+    if(!cb) {
+        //delete k;
+    }
+    return ret;
+}
+
+ssize_t store(struct filemgr *file, std::string str, 
+              void* buf, uint32_t vlen, struct callback_args *cb) {
+    key *k = new str_key(str);
+    return _store(file, k, buf, vlen, cb);
+}
+
+ssize_t store(struct filemgr *file, uint64_t vernum,
+              void* buf, uint32_t vlen, struct callback_args *cb) {
+    key *k = new vnum_key(vernum);
+    return _store(file, k, buf, vlen, cb);
+}
+
+ssize_t store(struct filemgr *file, uint64_t vernum, uint32_t log_num,
+              void* buf, uint32_t vlen, struct callback_args *cb) {
+    key *k = new log_key(vernum, log_num);
+    return _store(file, k, buf, vlen, cb);
+}
+
+ssize_t _retrieve(struct filemgr *file, key *k, 
+                  void *buf, struct callback_args *cb) {
+    ssize_t ret = file->ops_kvssd->retrieve(k, buf, cb);
+    if(!cb) {
+        delete k;
+    }
+    return ret;
+}
+
+ssize_t retrieve(struct filemgr *file, std::string str, 
+                 void* buf, struct callback_args *cb) {
+    key *k = new str_key(str);
+    return _retrieve(file, k, buf, cb);
+}
+
+ssize_t retrieve(struct filemgr *file, uint64_t vernum,
+                 void* buf, struct callback_args *cb) {
+    key *k = new vnum_key(vernum);
+    return _retrieve(file, k, buf, cb);
+}
+
+ssize_t retrieve(struct filemgr *file, uint64_t vernum, uint32_t log_num,
+                 void* buf, struct callback_args *cb) {
+    key *k = new log_key(vernum, log_num);
+    return _retrieve(file, k, buf, cb);
+}
+
+uint32_t _log_num_from_key(char* key) {
+    return *(uint32_t*)(key + strlen("LOGG") + sizeof(uint64_t));
+}
+
+uint64_t _log_bid_from_key(char* key) {
+    return *(uint64_t*)(key + strlen("LOGG"));
+}
+
+uint64_t get_timestamp()
+{
+    auto t0 = std::chrono::high_resolution_clock::now();        
+    return t0.time_since_epoch().count();
+}
+
+static void _signal_flush(struct filemgr *file)
+{
+    std::lock_guard<std::mutex> lock(file->flush_lock);
+    file->ready = true;
+    file->flush_cond.notify_all();
+}
+
+static void put_buf(void *buf)
+{
+    free(buf);
+    return;
+}
+
+static void * get_buf()
+{
+    return malloc(VALUE_RETRIEVE_LENGTH);
+}
+
+void put_large_buf(void *buf)
+{
+    put_buf(buf);
+    return;
+}
+
+void * get_large_buf()
+{
+    void *ret;
+    ret = malloc(LOG_RETRIEVE_LENGTH);
+    return ret;
+}
 
 #ifdef __DEBUG
 #ifndef __DEBUG_FILEMGR
@@ -60,6 +223,19 @@ static volatile unsigned int initial_lock_status = 0;
 static spin_t initial_lock;
 #endif
 
+#define METASIZE_ALIGN_UNIT (16)
+#ifdef METASIZE_ALIGN_UNIT
+#define _metasize_align(size) \
+         (((( (size + sizeof(metasize_t)) + (METASIZE_ALIGN_UNIT-1)) \
+             / METASIZE_ALIGN_UNIT) * METASIZE_ALIGN_UNIT) - sizeof(metasize_t))
+#else
+#define _metasize_align(size) (size)
+#endif
+
+union {
+    uint32_t i;
+    unsigned char c[4];
+} prefix;
 
 static volatile uint8_t filemgr_initialized = 0;
 extern volatile uint8_t bgflusher_initialized;
@@ -67,14 +243,15 @@ static struct filemgr_config global_config;
 static struct hash hash;
 static spin_t filemgr_openlock;
 
-static const int MAX_STAT_UPDATE_RETRIES = 5;
-
 struct temp_buf_item{
     void *addr;
     struct list_elem le;
 };
 static struct list temp_buf;
 static spin_t temp_buf_lock;
+// larger buffers
+static struct list temp_buf_kvssd;
+static spin_t kvssd_temp_buf_lock;
 
 static bool lazy_file_deletion_enabled = false;
 static register_file_removal_func register_file_removal = NULL;
@@ -114,6 +291,39 @@ static void mutex_unlock_wrap(void *lock) {
     mutex_unlock((mutex_t*)lock);
 }
 
+INLINE int _cmp_uint64_t(void *key1, void *key2, void *aux)
+{
+    (void) aux;
+    uint64_t a,b;
+    a = deref64(key1);
+    b = deref64(key2);
+
+#ifdef __BIT_CMP
+    return _CMP_U64(a, b);
+#else
+    if (a < b) {
+        return -1;
+    } else if (a > b) {
+        return 1;
+    } else {
+        return 0;
+    }
+#endif
+}
+
+INLINE int _cmp_binary64(void *key1, void *key2, void *aux)
+{
+    (void) aux;
+#ifdef __BIT_CMP
+    uint64_t a,b;
+    a = _endian_encode(deref64(key1));
+    b = _endian_encode(deref64(key2));
+    return _CMP_U64(a, b);
+#else
+    return memcmp(key1, key2, 8);
+#endif
+}
+
 static int _kvs_stat_cmp(struct avl_node *a, struct avl_node *b, void *aux)
 {
     struct kvs_node *aa, *bb;
@@ -141,6 +351,29 @@ static int _block_is_overlapped(void *pbid1, void *pis_writer1,
     is_writer2 = *(bid_t*)pis_writer2;
 
     if (bid1 != bid2) {
+        // not overlapped
+        return 0;
+    } else {
+        // overlapped
+        if (!is_writer1 && !is_writer2) {
+            // both are readers
+            return 0;
+        } else {
+            return 1;
+        }
+    }
+}
+
+static int _addr_is_overlapped(void *addr1, void *addris_writer1,
+                                void *addr2, void *addris_writer2,
+                                void *aux)
+{
+    (void)aux;
+    bid_t is_writer1, is_writer2;
+    is_writer1 = *(bid_t*)addris_writer1;
+    is_writer2 = *(bid_t*)addris_writer2;
+
+    if (addr1 != addr2) {
         // not overlapped
         return 0;
     } else {
@@ -211,10 +444,16 @@ void filemgr_init(struct filemgr_config *config)
 
             bcache_config bconfig;
             bconfig.do_not_cache_doc_blocks = global_config.do_not_cache_doc_blocks;
+            kvcache_config kcconfig;
             if (global_config.ncacheblock > 0) {
                 bcache_init(global_config.ncacheblock,
-                            global_config.blocksize,
+                            global_config.index_blocksize,
                             bconfig);
+            }
+
+            if(global_config.kv_cache_size > 0) {
+                kcconfig.blocksize = config->blocksize;
+                kvcache_init(global_config.kv_cache_size, kcconfig);
             }
 
             hash_init(&hash, NBUCKET, _file_hash, _file_cmp);
@@ -223,6 +462,14 @@ void filemgr_init(struct filemgr_config *config)
             list_init(&temp_buf);
             spin_init(&temp_buf_lock);
 
+            if(config->kvssd) {
+                /*
+                    Initialize larger temp buffers for the KVSSD
+                    as single writes can be much larger than a page
+                */
+                list_init(&temp_buf_kvssd);
+                spin_init(&kvssd_temp_buf_lock);
+            }
             // initialize global lock
             spin_init(&filemgr_openlock);
 
@@ -247,59 +494,8 @@ void filemgr_set_sb_operation(struct sb_ops ops)
     sb_ops = ops;
 }
 
-static void * _filemgr_get_temp_buf()
-{
-    struct list_elem *e;
-    struct temp_buf_item *item;
-
-    spin_lock(&temp_buf_lock);
-    e = list_pop_front(&temp_buf);
-    if (e) {
-        item = _get_entry(e, struct temp_buf_item, le);
-    } else {
-        void *addr = NULL;
-
-        size_t alloc_size = global_config.blocksize
-                            + sizeof(struct temp_buf_item);
-        malloc_align(addr, FDB_SECTOR_SIZE, alloc_size);
-        memset(addr, 0x0, alloc_size);
-        item = (struct temp_buf_item *)((uint8_t *) addr + global_config.blocksize);
-        item->addr = addr;
-    }
-    spin_unlock(&temp_buf_lock);
-
-    return item->addr;
-}
-
-static void _filemgr_release_temp_buf(void *buf)
-{
-    struct temp_buf_item *item;
-
-    spin_lock(&temp_buf_lock);
-    item = (struct temp_buf_item*)((uint8_t *)buf + global_config.blocksize);
-    list_push_front(&temp_buf, &item->le);
-    spin_unlock(&temp_buf_lock);
-}
-
-static void _filemgr_shutdown_temp_buf()
-{
-    struct list_elem *e;
-    struct temp_buf_item *item;
-    size_t count=0;
-
-    spin_lock(&temp_buf_lock);
-    e = list_begin(&temp_buf);
-    while(e){
-        item = _get_entry(e, struct temp_buf_item, le);
-        e = list_remove(&temp_buf, e);
-        free_align(item->addr);
-        count++;
-    }
-    spin_unlock(&temp_buf_lock);
-}
-
 // Read a block from the file, decrypting if necessary.
-static ssize_t filemgr_read_block(struct filemgr *file, void *buf, bid_t bid) {
+ssize_t filemgr_read_block(struct filemgr *file, void *buf, bid_t bid) {
     ssize_t result = file->ops->pread(file->fd, buf, file->blocksize,
                                       file->blocksize*bid);
     if (file->encryption.ops && result > 0) {
@@ -312,11 +508,64 @@ static ssize_t filemgr_read_block(struct filemgr *file, void *buf, bid_t bid) {
     return result;
 }
 
+// Read a block from the file, decrypting if necessary.
+ssize_t filemgr_read_block(struct filemgr *file, void *_key, void *buf, bid_t bid) {
+    ssize_t result;
+
+    if (file->config->kvssd) {
+        if (_key != NULL) {
+            std::string keyBuf = (char *) _key + std::to_string(bid);
+            result = retrieve(file, keyBuf, buf, NULL);
+            if (result != (ssize_t)file->blocksize) {
+                return FDB_RESULT_READ_FAIL;
+            }
+        } else { // only use vernum as key
+            result = retrieve(file, bid, buf, NULL);
+            if (result != file->blocksize) {
+                return FDB_RESULT_READ_FAIL;
+            }
+        }
+
+        if (file->encryption.ops && result > 0) {
+            if (result != (ssize_t)file->blocksize) {
+                return FDB_RESULT_READ_FAIL;
+            }
+
+            fdb_status status = fdb_decrypt_block(&file->encryption, buf, result, bid);
+            if (status != FDB_RESULT_SUCCESS) {
+                return status;
+            }
+        }
+
+        return file->blocksize;
+    } else {
+        ssize_t result = file->ops->pread(file->fd, buf, file->blocksize,
+                                          file->blocksize*bid);
+        if (file->encryption.ops && result > 0) {
+            if (result != (ssize_t)file->blocksize) {
+
+                return FDB_RESULT_READ_FAIL;
+            }
+
+            fdb_status status = fdb_decrypt_block(&file->encryption, buf, result, bid);
+            if (status != FDB_RESULT_SUCCESS) {
+                if(filemgr_get_file_status(file) == FILE_COMPACT_OLD) {
+                }
+                return status;
+            }
+        }
+        if(filemgr_get_file_status(file) == FILE_COMPACT_OLD) {
+        }
+        return result;
+    }
+}
+
 // Write consecutive block(s) to the file, encrypting if necessary.
 ssize_t filemgr_write_blocks(struct filemgr *file, void *buf, unsigned num_blocks, bid_t start_bid) {
     size_t blocksize = file->blocksize;
     cs_off_t offset = start_bid * blocksize;
     size_t nbytes = num_blocks * blocksize;
+
     if (file->encryption.ops == NULL) {
         return file->ops->pwrite(file->fd, buf, nbytes, offset);
     } else {
@@ -341,19 +590,1019 @@ ssize_t filemgr_write_blocks(struct filemgr *file, void *buf, unsigned num_block
     }
 }
 
+// Write consecutive block(s) to the file, encrypting if necessary.
+ssize_t filemgr_write_blocks_kvssd(struct filemgr *file, void *_key, void *buf, unsigned num_blocks, bid_t start_bid) {
+    size_t blocksize = file->blocksize;
+    ssize_t result;
+    size_t nbytes = num_blocks * blocksize;
+    size_t klen;
+
+    if (file->encryption.ops == NULL) {
+        if (_key != NULL && ((char *)_key)[0] == '@') { // only write super blocks differently
+            std::string keyBuf = (char *) _key + std::to_string(start_bid);
+
+            result = store(file, keyBuf, buf, num_blocks * blocksize, NULL);
+            klen = keyBuf.length();
+
+            atomic_add_uint64_t(&file->data_in_kvssd, 
+                                VALUE_RETRIEVE_LENGTH - 1024 + sizeof(uint64_t));
+            atomic_add_uint64_t(&file->written_to_kvssd, nbytes + klen);
+        } else {
+            result = store(file, start_bid, buf, num_blocks * blocksize, NULL);
+            klen = sizeof(start_bid);
+
+            atomic_add_uint64_t(&file->data_in_kvssd, nbytes + klen);
+            atomic_add_uint64_t(&file->written_to_kvssd, nbytes + klen);
+        }
+
+    } else {
+        uint8_t *encrypted_buf;
+        if (nbytes > 4096)
+            encrypted_buf = (uint8_t*)malloc(nbytes);
+        else
+            encrypted_buf = alca(uint8_t, nbytes); // most common case (writing single block)
+        if (!encrypted_buf)
+            return FDB_RESULT_ALLOC_FAIL;
+        fdb_status status = fdb_encrypt_blocks(&file->encryption,
+                                               encrypted_buf,
+                                               buf,
+                                               blocksize,
+                                               num_blocks,
+                                               start_bid);
+        if (nbytes > 4096)
+            free(encrypted_buf);
+        if (status != FDB_RESULT_SUCCESS)
+            return status;
+        result = store(file, start_bid, encrypted_buf, nbytes, NULL);
+        return result;
+    }
+
+    return result;
+}
+
+// Write consecutive block(s) to the file, encrypting if necessary.
+ssize_t filemgr_write_pair_kvssd(struct filemgr *file, void *val, size_t vlen, bid_t vernum) 
+{
+    size_t nbytes = vlen;
+
+    if (file->encryption.ops == NULL) {
+        return store(file, vernum, val, vlen, NULL);
+    } else {
+        uint8_t *encrypted_buf;
+        if (nbytes > 4096)
+            encrypted_buf = (uint8_t*)malloc(nbytes);
+        else
+            encrypted_buf = alca(uint8_t, nbytes); // most common case (writing single block)
+        if (!encrypted_buf)
+            return FDB_RESULT_ALLOC_FAIL;
+        fdb_status status = fdb_encrypt_blocks(&file->encryption,
+                                               encrypted_buf,
+                                               val,
+                                               vlen,
+                                               1,
+                                               vernum);
+        if (nbytes > 4096)
+            free(encrypted_buf);
+        if (status != FDB_RESULT_SUCCESS)
+            return status;
+        return store(file, vernum, encrypted_buf, nbytes, NULL);
+    }
+}
+
+
+INLINE struct bnode *_fetch_bnode(void *addr)
+{
+    struct bnode *node = NULL;
+
+    node = (struct bnode *)addr;
+
+    if (!(node->flag & BNODE_MASK_METADATA)) {
+        // no metadata
+        node->data = (uint8_t *)addr + sizeof(struct bnode);
+    } else {
+        // metadata
+        metasize_t metasize;
+        memcpy(&metasize, (uint8_t *)addr + sizeof(struct bnode), sizeof(metasize_t));
+        metasize = _endian_decode(metasize);
+        node->data = (uint8_t *)addr + sizeof(struct bnode) + sizeof(metasize_t) +
+                     _metasize_align(metasize);
+    }
+
+    return node;
+}
+
+struct bnode* _init_bnode(uint64_t bid, void *addr)
+{
+    struct bnode* node;
+
+    node = (struct bnode *)addr;
+    node->kvsize = 8 << 8 | 8;
+    node->nentry = 0;
+    node->level = 100;
+    node->flag = 0;
+    node->bid = bid;
+    node->data = (uint8_t *)addr + sizeof(struct bnode);
+
+    return node;
+}
+
+/*
+ * In us
+ */
+
+struct lat_tracking {
+    uint64_t first_read_sub;
+    uint64_t last_read_sub;
+    uint64_t *read_lats;
+    uint64_t entered_reduce;
+    uint64_t waited_for_lock;
+    uint64_t left_reduce;
+};
+
+struct collect_logs_cb_args
+{
+    struct filemgr *file;
+    atomic_uint32_t *valid;
+    uint32_t log_num;
+    std::unordered_map<std::string, uint64_t> *pairs;
+    std::set<std::string> *expired_pairs;
+    std::unordered_map<std::string, uint64_t> *ret;
+    uint64_t *timestamps;
+    uint16_t *level;
+    atomic_uint16_t *outstanding_reads;
+    atomic_uint16_t *complete;
+    uint64_t bid;
+    void (*cb)(std::unordered_map<std::string, uint64_t>*, void*, void*, bool);
+    void *voidargs;
+    std::string *latest_log;
+    struct lat_tracking *lat;
+};
+
+void _compact_logs_cb(std::unordered_map<std::string, uint64_t> *log, 
+        void *voidargs,
+        void* buf,
+        bool nested);
+
+void __filemgr_collect_logs_cb(struct collect_logs_cb_args *args,
+                               uint64_t len, char *buf, 
+                               bool nested) {
+    struct filemgr *file;
+    uint64_t vernum;
+    uint32_t log_num;
+    uint64_t bid;
+    uint32_t max_logs;
+    std::string *latest_log;
+    uint64_t *timestamps;
+    uint64_t timestamp;
+    bool entered = false;
+    bool last = false;
+
+    file = args->file; 
+    log_num = args->log_num;
+    bid = args->bid;
+    max_logs = file->config->max_logs_per_node + 1;
+    latest_log = args->latest_log;
+    timestamps = args->timestamps;
+
+    uint64_t ts = get_monotonic_ts_us();
+    args->lat->read_lats[log_num] = ts - args->lat->read_lats[log_num];
+
+    if(atomic_decr_uint16_t(args->outstanding_reads) == 0) {
+        last = true;
+    }
+
+    if(len == 0) {
+        goto end;
+    }
+
+    timestamp = *(uint64_t*)((uint8_t*)buf + (len - sizeof(uint64_t)));
+    timestamps[log_num] = timestamp;
+
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "Got timestamp %lu for bid %lu log %u", timestamp, bid, log_num);
+
+    for(unsigned int j = 0; j < len / log_entry_size; j++) {
+        std::string key_from_log = std::string(buf + (j * 16), 8);
+        vernum = *(uint64_t*)(buf + (j * 16) + 8);
+
+        if(args->log_num == 0 && j == 0) {
+            assert(!strncmp(key_from_log.c_str(), "LEVEL___", 8));
+            (*args->level) = *(uint16_t*)(buf + (j * 16) + 8);
+            //printf("got %s %u\n", key_from_log.c_str(), (*args->level)); 
+            continue;
+        }
+
+        if(!strncmp("LEVEL___", key_from_log.c_str(), 8)) {
+            continue;
+        }
+
+        fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                "Got %s %lu in bid %lu log_num %u", 
+                key_from_log.c_str(), vernum,  
+                bid, log_num);
+
+        if(vernum == BLK_NOT_FOUND) {
+            args->expired_pairs[log_num].insert(key_from_log);
+            continue;
+        }
+
+        auto entry = args->pairs[log_num].find(key_from_log);
+        if(entry != args->pairs[log_num].end()) {
+            entry->second = vernum;
+        } else {
+            args->pairs[log_num].insert({key_from_log, vernum});
+        }
+
+    }
+
+end:
+    if(last) {
+        entered = true;
+        args->lat->entered_reduce = get_monotonic_ts_us();
+
+        std::set<std::string> exp = std::set<std::string>();
+        for(unsigned int i = 0; i < max_logs; i++) {
+
+            /*
+             * Logs were read before being deleted
+             */
+
+            if(timestamps[i] < timestamps[0]) {
+                fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                        "log %u was too old bid %lu (%lu %lu)", 
+                        i, bid, timestamps[i], timestamps[0]);
+                continue;
+            }
+
+            atomic_incr_uint32_t(args->valid);
+
+            for(auto &it: args->expired_pairs[i]) {
+                exp.insert(it);
+            }
+        }
+
+        for(unsigned int i = 0; i < max_logs; i++) {
+            if(timestamps[i] < timestamps[0]) {
+                continue;
+            }
+
+            for(auto &it: args->pairs[i]) {
+                if(exp.count(it.first) == 0) {
+                    auto entry = args->ret->find(it.first);
+                    if(entry != args->ret->end()) {
+                        entry->second = it.second;
+                    } else {
+                        args->ret->insert({it.first, it.second});
+                    }
+                } else {
+                    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                            "%s skipped in merge", it.first.c_str()); 
+                }
+            }
+        }
+
+        if(latest_log && !latest_log->empty()) {
+            (*args->level) = *(uint16_t*)(latest_log->c_str() + 8);
+
+            for(unsigned int j = 1; j < latest_log->length() / log_entry_size; j++) {
+                std::string key_from_log = latest_log->substr(j * 16, 8); 
+                uint64_t val_from_log = *(uint64_t*)(latest_log->c_str() + (j * 16) + 8);
+
+                if(!strncmp("LEVEL___", key_from_log.c_str(), 8)) {
+                    assert(0);
+                    continue;
+                }
+
+                if(val_from_log == BLK_NOT_FOUND) {
+                    args->ret->erase(key_from_log);
+                    continue;
+                    assert(0);
+                }
+
+                (*args->ret)[key_from_log] = val_from_log;
+            } 
+        }
+
+        uint64_t t1, t2;
+        t1 = get_monotonic_ts_us();
+        mutex_lock(&file->logs_per_node_lock);
+        t2 = get_monotonic_ts_us();
+        args->lat->waited_for_lock = t2 - t1;
+        //assert(args->valid->load() == file->logs_per_node->find(bid)->second);
+        file->logs_per_node->insert({bid, atomic_get_uint32_t(args->valid)});
+        mutex_unlock(&file->logs_per_node_lock);
+        fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                "%u valid for bid %lu\n", atomic_get_uint32_t(args->valid), bid);
+        args->lat->left_reduce = get_monotonic_ts_us();
+    }
+
+    if(args->cb) {
+        atomic_decr_uint16_t(args->complete);
+    }
+
+    if(last && args->cb) {
+        while(atomic_get_uint16_t(args->complete) > 0) {
+            usleep(1);
+        }
+    }
+
+    if(args->cb && last) {
+        fflush(stdout);
+        args->cb(args->ret, args->voidargs, buf, nested);
+        put_large_buf(buf);
+        delete args->ret;
+        delete args->outstanding_reads;
+        delete args->valid;
+        delete[] args->pairs;
+        delete[] args->expired_pairs;
+        delete latest_log;
+        delete args->complete;
+        free(args->lat->read_lats);
+        free(args->lat);
+        free(timestamps);
+    } else if(args->cb) {
+        put_large_buf(buf);
+    }
+
+    if(!args->cb) {
+        atomic_decr_uint16_t(args->complete);
+    }
+
+    free(args);
+}
+
+#ifndef __KVSSD_EMU
+void _filemgr_collect_logs_cb(struct nvme_passthru_kv_cmd cmd, 
+                              void *voidargs)
+{
+    uint64_t len;
+    char *buf;
+    struct callback_args* cb_args;
+    struct collect_logs_cb_args *args;
+
+    len = cmd.data_length;
+    buf = (char*)((void*) cmd.data_addr);
+    cb_args = (struct callback_args*)voidargs;
+    args = (struct collect_logs_cb_args*)cb_args->args;
+
+    __filemgr_collect_logs_cb(args, len, buf, cb_args->nested);
+    free(cb_args);
+}
+#else
+void _filemgr_collect_logs_cb(kvs_postprocess_context* ioctx) 
+{
+    uint64_t len;
+    char *buf;
+    struct callback_args* cb_args;
+    struct collect_logs_cb_args *args;
+
+    len = ioctx->value->actual_value_size;
+    buf = (char*)(ioctx->value->value);
+    cb_args = (struct callback_args*)ioctx->private1;
+    args = (struct collect_logs_cb_args*)cb_args->args;
+
+    __filemgr_collect_logs_cb(args, len, buf, cb_args->nested);
+    free(cb_args);
+    _ioctx_free_func(ioctx, true, true);
+}
+#endif
+
+struct filemgr_collect_node_cb_args
+{
+    struct filemgr *file;
+    struct bnode* node;
+    uint16_t *level;
+    uint64_t offset;
+    struct filemgr_read_cb_args *fmgr_cb_args;
+};
+
+std::unordered_map<std::string, uint64_t> buf_to_ret(void *buf, uint16_t *level) {
+    std::unordered_map<std::string, uint64_t> ret;
+    struct bnode *bnode = btree_get_bnode(buf);
+    char* data = (char*)bnode->data;
+    uint64_t vernum;
+
+    for(int i = 0; i < bnode->nentry; i++) {
+        std::string k = std::string(data + (i * 16), 8);
+        vernum = *(uint64_t*)(data + (i * 16) + 8);
+        ret.insert({k, vernum});
+    }
+
+    *level = bnode->level;
+
+    return ret;
+}
+
+std::unordered_map<std::string, uint64_t> 
+_filemgr_collect_logs(struct filemgr *file, uint64_t bid, 
+                      uint16_t *level, std::string *latest_log,
+                      void (*cb)(std::unordered_map<std::string, uint64_t>*, void*, void*, bool), 
+                      void *voidargs,
+                      bool nested)
+{
+    void *buf;
+    atomic_uint32_t *valid;
+    uint32_t max_logs;
+    atomic_uint16_t *outstanding_reads;
+    atomic_uint16_t *complete;
+    uint64_t *timestamps;
+    int cached;
+
+    max_logs = file->config->max_logs_per_node + 1;
+    auto pairs = new std::unordered_map<std::string, uint64_t>[max_logs];
+    auto expired_pairs = new std::set<std::string>[max_logs];
+    auto ret = new std::unordered_map<std::string, uint64_t>();
+    timestamps = (uint64_t*)malloc(sizeof(uint64_t) * max_logs);
+    void *bufs[max_logs];
+
+    for(unsigned int i = 0; i < max_logs; i++) {
+        timestamps[i] = 0;
+    }
+
+    valid = new atomic_uint32_t();
+    outstanding_reads = new atomic_uint16_t();
+    complete = new atomic_uint16_t();
+
+    atomic_init_uint32_t(valid, 0);
+    atomic_init_uint16_t(outstanding_reads, max_logs);
+    atomic_init_uint16_t(complete, max_logs);
+
+    if(latest_log && !latest_log->empty()) {
+        assert(latest_log->length() > 16);
+    }
+
+    //bool all_cached = true;
+
+    struct lat_tracking *lat;
+    struct lat_tracking lat_static;
+
+    if(!cb) {
+        lat = &lat_static;
+    } else {
+        lat = (struct lat_tracking*)malloc(sizeof(*lat));
+    }
+    memset(lat, 0x0, sizeof(*lat));
+    lat->read_lats = (uint64_t*)malloc(sizeof(uint64_t) * max_logs);
+
+    for(uint32_t i = 0; i < max_logs; i++) {
+        struct callback_args *kvssd_cb_args;
+        struct collect_logs_cb_args *collect_args;
+
+        kvssd_cb_args = 
+            (struct callback_args*)malloc(sizeof(struct callback_args));
+        kvssd_cb_args->cb = _filemgr_collect_logs_cb;
+        
+        collect_args = (struct collect_logs_cb_args*)malloc(sizeof(*collect_args)); 
+        collect_args->file = file;
+        collect_args->valid = valid;
+        collect_args->log_num = i;
+        collect_args->level = level;
+        collect_args->outstanding_reads = outstanding_reads;
+        collect_args->complete = complete;
+        collect_args->pairs = pairs;
+        collect_args->expired_pairs = expired_pairs;
+        collect_args->ret = ret;
+        collect_args->bid = bid;
+        collect_args->cb = cb;
+        collect_args->voidargs = voidargs;
+        collect_args->latest_log = latest_log;
+        collect_args->timestamps = timestamps;
+        collect_args->lat = lat;
+        collect_args->lat->read_lats[i] = get_monotonic_ts_us();
+
+        kvssd_cb_args->args = collect_args;
+
+        buf = get_large_buf();
+        bufs[i] = buf;
+
+        if(nested) assert(0);
+
+        cached = kvcache_read_log(file, bid, buf, i);
+        if(cached) {
+#ifndef __KVSSD_EMU
+            struct nvme_passthru_kv_cmd dummy;
+            memset(&dummy, 0x0, sizeof(dummy));
+            dummy.data_length = cached;
+            dummy.data_addr = (uint64_t) buf;
+            dummy.result = 0;
+            kvssd_cb_args->nested = false;
+            _filemgr_collect_logs_cb(dummy, kvssd_cb_args);
+#else
+            _filemgr_collect_logs_cb(NULL);
+#endif
+        } else if(nested) {
+            assert(0);
+        } else {
+            retrieve(file, bid, i, buf, kvssd_cb_args);
+        }
+
+        if(i == 0) {
+            lat->first_read_sub = get_monotonic_ts_us();
+        } else if(i == max_logs - 1) {
+            lat->last_read_sub = get_monotonic_ts_us();
+        }
+    }
+
+done:
+    if(!cb) {
+        while(atomic_get_uint16_t(complete) > 0) {
+            usleep(1);
+        }
+
+        for(uint16_t i = 0; i < max_logs; i++) {
+            put_large_buf(bufs[i]);
+        }
+
+        delete outstanding_reads;
+        delete valid;
+        delete[] pairs;
+        delete[] expired_pairs;
+        delete complete;
+        free(timestamps);
+    
+        if(lat->left_reduce - lat->first_read_sub > 100000000) {
+            printf("\nTID %lu *** COLLECTION TOOK %luus. %lu TO SUBMIT ALL.\n"
+                   "%lu FROM LAST SUBMISSION TO ENTER REDUCE.\n"
+                   "%lu TIME SPENT REDUCING. WAITED %lu FOR LOCK.\n"
+                   "READ_LATS: %lu %lu %lu %lu %lu\n",
+                   pthread_self(),
+                   lat->left_reduce - lat->first_read_sub,
+                   lat->last_read_sub - lat->first_read_sub,
+                   lat->entered_reduce - lat->last_read_sub,
+                   lat->left_reduce - lat->entered_reduce,
+                   lat->waited_for_lock,
+                   lat->read_lats[0], lat->read_lats[1], lat->read_lats[2],
+                   lat->read_lats[3], lat->read_lats[4]);
+            check_lat = 1;
+        }
+        free(lat->read_lats);
+
+        auto tmp = std::unordered_map<std::string, uint64_t>(*ret);
+        delete ret;
+        return tmp;
+    } else {
+        return std::unordered_map<std::string, uint64_t>();
+    }
+}
+
+void filemgr_clear_logs(struct filemgr *file) {
+    file->outstanding_logs->clear();
+}
+
+/*
+ * We do not want write_log to block on log compaction, and instead
+ * make it asynchronous so other log writes can proceed in the meantime.
+ * The process is as follows : logs are collected asynchronously with
+ * retrieves in _filemgr_collect_logs, and each log deducts an atomic counter
+ * in the callback. When a callback deducts the counter and it equals 0, it
+ * is the last log to be collected. The log is then compacted and passed back
+ * to filemgr_write_log.
+ */
+
+struct _filemgr_write_log_args {
+    struct filemgr *file;
+    uint64_t bid;
+    std::string *log;
+    bool sync;
+    atomic_uint64_t *count;
+};
+
+struct _compact_logs_args {
+    struct filemgr *file;
+    atomic_uint64_t *log_write_count; // how many logs to be written in filemgr_write_log
+    uint64_t bid;
+    std::string *ret;
+    std::string *log;
+    uint16_t *level;
+};
+
+void _compact_logs_cb(std::unordered_map<std::string, uint64_t> *log, 
+                      void *voidargs,
+                      void* buf,
+                      bool nested)
+{
+    struct filemgr *file;
+    uint64_t bid;
+    struct _compact_logs_args *args;
+    uint16_t level;
+    std::string *ret;
+    uint64_t vernum;
+    std::string latest_log;
+
+    args = (struct _compact_logs_args*)voidargs;
+
+    file = args->file;
+    bid = args->bid;
+    ret = args->ret;
+    level = *args->level;
+    ret->append("LEVEL___", 8);
+
+    uint64_t tmp_level = (uint64_t)level;
+    ret->append((char*)&tmp_level, 8);
+    assert(level < 5);
+
+    for(auto i: *log) {
+        ret->append(i.first);
+        vernum = i.second;
+        assert(vernum != BLK_NOT_FOUND);
+        ret->append((char*)&vernum, 8);
+    }
+
+    assert(ret->length() > 16);
+
+    mutex_lock(&file->logs_per_node_lock);
+    (*file->logs_per_node)[bid] = 0;
+    mutex_unlock(&file->logs_per_node_lock);
+
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "In repack CB for %lu\n", bid);
+
+    /*
+     * Because we are continually adding logs to data_in_kvssd in filemgr_write_log,
+     * we remove all the log data from data_in_kvssd for this node here. This means
+     * that there is a brief period of time before the logs are re-written where
+     * data_in_kvssd is lower than reality. However, when measuring space amplification
+     * we take the highest seen value throughout and entire benchmark, not
+     * the lowest.
+     */
+
+    atomic_sub_uint64_t(&file->data_in_kvssd, 
+                        1024 * file->config->max_logs_per_node);
+
+    filemgr_write_log(file, bid, ret, true, NULL, true);
+
+    delete args->level;
+    delete args->log;
+    atomic_decr_uint64_t(args->log_write_count);
+    free(args);
+}
+
+std::string _compact_log(struct filemgr *file, uint64_t bid, atomic_uint64_t *count, bool sync)
+{
+    uint16_t *level;
+    struct _compact_logs_args *args;
+    auto ret = new std::string();
+
+    level = new uint16_t();
+    args = (struct _compact_logs_args*)malloc(sizeof(*args));
+
+    args->file = file;
+    args->log_write_count = count;
+    args->bid = bid;
+    args->ret = ret;
+    args->log = NULL;
+    args->level = level;
+
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "Compacting %lu\n", bid);
+
+    char _buf[LOG_RETRIEVE_LENGTH];
+    if(bcache_read(file, bid, _buf)) {
+        fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                "%lu was cached\n", bid);
+        auto reduced = buf_to_ret(_buf, args->level);
+        _compact_logs_cb(&reduced, args, NULL, false);
+    } else {
+        auto log_map = _filemgr_collect_logs(file, bid, level, NULL, _compact_logs_cb, args, false);
+    }
+    
+    return std::string();
+}
+
+struct _write_log_cb_args {
+    struct filemgr *file;
+    uint64_t bid; 
+    std::string *log;
+    uint32_t log_num;
+    atomic_uint64_t *count;
+};
+
+void __write_log_cb(struct _write_log_cb_args *args) {
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "Write log CB for bid %lu log_num %u",
+            args->bid, args->log_num);
+    delete args->log;
+    if(args->count) {
+        atomic_decr_uint64_t(args->count);
+    }
+}
+
+#ifndef __KVSSD_EMU
+void _write_log_cb(struct nvme_passthru_kv_cmd cmd, void* voidargs)
+{
+    struct callback_args *kvssd_cb_args;
+    struct _write_log_cb_args *args;
+
+    kvssd_cb_args = (struct callback_args*)voidargs;
+    args = (struct _write_log_cb_args*)kvssd_cb_args->args;
+
+    __write_log_cb(args);
+
+    put_large_buf((void*) cmd.data_addr);
+    free(args);
+    free(kvssd_cb_args);
+}
+#else
+void _write_log_cb(kvs_postprocess_context* ioctx) 
+{
+    struct callback_args *cb_args;
+    struct _write_log_cb_args *args;
+
+    cb_args = (struct callback_args*)ioctx->private1;
+    args = (struct _write_log_cb_args*)cb_args->args;
+
+    __write_log_cb(args);
+
+    _ioctx_free_func(ioctx, true, true);
+    free(cb_args);
+    free(args);
+}
+#endif
+
+void filemgr_write_log(struct filemgr *file, uint64_t bid, std::string *log, 
+                       bool sync, atomic_uint64_t *count, bool purge)
+{
+    int ksize = file->config->bnode_ksize;
+    int vsize = file->config->bnode_vsize;
+    int kvsize = ksize + vsize;
+
+    uint32_t nlog = log->size() / kvsize;
+    char *ch_log = const_cast<char*>(log->c_str());
+    std::string log_slice;
+    void *buf;
+
+    uint32_t nbytes = 0;
+    uint32_t log_num;
+    uint64_t timestamp;
+    uint64_t vlen;
+
+    if(nlog == 0) {
+        assert(0);
+    }
+
+    while (nlog > 0) {
+        int n = 0;
+        if ((purge && ((nlog - 1) > MAX_ENTRIES_PER_LOG_WRITE)) ||
+            (nlog > MAX_ENTRIES_PER_LOG_WRITE)) {
+
+            auto nlogs = nlog % MAX_ENTRIES_PER_LOG_WRITE == 0 ?
+                         nlog / MAX_ENTRIES_PER_LOG_WRITE :
+                         (nlog / MAX_ENTRIES_PER_LOG_WRITE) + 1;
+
+			if(nlogs / MAX_ENTRIES_PER_LOG_WRITE > 
+			   file->config->max_logs_per_node){
+                printf("nlog was %u which is %u logs\n",
+                        nlog, nlogs);
+				assert(0);
+			}
+
+            if(purge) {
+                printf("Log too big on compact for bid %lu! Inside log:\n",
+                        bid);
+                for(int i = 0; i < log->size() / 16; i++) {
+                    std::string entry = std::string(log->c_str() + (i * 16), 8);
+                    printf("%s\n", entry.c_str()); 
+                }
+                assert(0);
+            }
+
+            n = MAX_ENTRIES_PER_LOG_WRITE;
+            nlog -= MAX_ENTRIES_PER_LOG_WRITE;
+            atomic_incr_uint64_t(count);
+        } else {
+            n = nlog;
+            nlog = 0;
+        }
+
+        /*
+         * Key : offset + log number
+         * Value : KV pairs + timestamp
+         */
+
+        /*
+         * logs_per_node is modified here, during a WAL flush, 
+         * or at the end of a log compaction.
+         * Log writes and log compactions happens in order in the flush thread,
+         * and neither can happen when the WAL is flushing, but we still take
+         * the log_lock here because logs_per_node can be updated by
+         * _filemgr_collect_logs_cb.
+         */
+
+        mutex_lock(&file->logs_per_node_lock);
+        auto i = file->logs_per_node->find(bid);
+        if(i == file->logs_per_node->end()) {
+            log_num = 0;
+            file->logs_per_node->insert({bid, 1});
+            atomic_add_uint64_t(&file->data_in_kvssd, 1024);
+            atomic_add_uint64_t(&file->written_to_kvssd, 1024);
+        } else {
+            log_num = i->second;
+            file->logs_per_node->find(bid)->second++;
+
+            if(file->logs_per_node->find(bid)->second >
+                   file->config->max_logs_per_node + 1) {
+                fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                        "Too many logs bid %lu\n", bid);
+            }
+
+            assert(file->logs_per_node->find(bid)->second <= 
+                   file->config->max_logs_per_node + 1);
+
+            atomic_add_uint64_t(&file->data_in_kvssd, 1024);
+            atomic_add_uint64_t(&file->written_to_kvssd, 1024);
+        }
+
+        mutex_unlock(&file->logs_per_node_lock);
+
+        /*
+         * Queue this index node for a compaction. to_repack is only
+         * written to here when filemgr_write_logs is called from 
+         * _log_flush_thread, and is read in filemgr_compact_logs which
+         * is only called after filemgr_write_logs.
+         */
+
+        if(log_num == file->config->max_logs_per_node) {
+            if(log->length() <= 16) {
+                printf("log_num == file->config->max_logs_per_node %s", log->c_str());
+            }
+            assert(std::find(file->to_repack->begin(), 
+                  file->to_repack->end(), bid) == file->to_repack->end());
+            file->to_repack->push_back(bid);
+        }
+
+        timestamp = get_timestamp();
+        log_slice = std::string(ch_log, (n * log_entry_size));
+        log_slice.append((char*)&timestamp, 8);
+        assert(log_slice.length() == ((n * log_entry_size) + 8));
+        if(log_num == 0) {
+            assert(!strncmp(ch_log, "LEVEL___", 8));
+        }
+
+        vlen = log_slice.length();
+        assert(vlen <= LOG_RETRIEVE_LENGTH);
+        buf = get_large_buf();
+        memcpy(buf, log_slice.c_str(), vlen);
+
+        fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                "Writing log %u len %u in %s for %lu with ts %lu. Inside:", 
+                log_num, vlen,
+                purge ? "compaction" : "normal write", bid, timestamp);
+
+        if(file->config->kv_cache_size > 0) {
+            //kvcache_wipe_log(file, bid, log_num); 
+            //kvcache_write_log(file, bid, buf, vlen, log_num, KVCACHE_REQ_CLEAN); 
+        }
+
+        if(sync) {
+            store(file, bid, log_num, buf, vlen, NULL);
+
+            if(!purge) {
+                atomic_decr_uint64_t(count);
+            } else {
+                int ret = file->ops_kvssd->flush();
+
+                if(ret) {
+                    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                            "Flushed %d in compaction cb", ret);
+                }
+            }
+        } else {
+            struct callback_args *kvssd_cb_args;
+            kvssd_cb_args = (struct callback_args*)malloc(sizeof(*kvssd_cb_args));
+            struct _write_log_cb_args *args;
+            args = (struct _write_log_cb_args*)malloc(sizeof(*args));
+
+            args->file = file;
+            args->bid = bid;
+            args->log = new std::string(ch_log, vlen - sizeof(uint64_t));
+            args->log_num = log_num;
+            args->count = count;
+
+            kvssd_cb_args->cb = _write_log_cb;
+            kvssd_cb_args->args = args;
+            kvssd_cb_args->nested = purge ? false : false;
+
+            store(file, bid, log_num, buf, vlen, kvssd_cb_args);
+        }
+
+        free(buf);
+
+        nbytes += LOG_KLEN;
+        ch_log += (n * kvsize);
+    }
+
+    if(purge) {
+        for(int i = 1; i < file->config->max_logs_per_node + 1; i++) {
+            //kvcache_wipe_log(file, bid, i); 
+        }
+        //file->log_del_lock.lock();
+        //file->logs_to_remove->push_back(bid);
+        //file->log_del_lock.unlock();
+    }
+
+    delete log;
+}
+
+/*
+ * Will also clear the logs once all of the logs have been written
+ */
+
+void filemgr_write_logs(struct filemgr *file, bool sync,
+                        std::unordered_map<uint64_t, std::string> to_flush)
+{
+    atomic_uint64_t *count;
+
+    assert(atomic_get_uint8_t(&file->flushing));
+
+    count = new atomic_uint64_t();
+    atomic_init_uint64_t(count, to_flush.size());
+
+    if(to_flush.size() > 0) {
+        for(auto i: to_flush) {
+            filemgr_write_log(file, i.first, new std::string(i.second), 
+                              sync, count, false);
+        }
+    } 
+
+    uint64_t sleep_count = 0;
+    while(atomic_get_uint64_t(count) > 0) {
+        usleep(1);
+        sleep_count++;
+
+        if(sleep_count == 100) {
+            file->ops_kvssd->flush();
+            sleep_count = 0;
+        }
+    }
+
+    file->ops_kvssd->flush();
+    delete count;
+}
+
+void filemgr_compact_logs(struct filemgr *file, bool sync)
+{
+    atomic_uint64_t *count;
+
+    count = new atomic_uint64_t();
+    atomic_init_uint64_t(count, file->to_repack->size());
+
+    for(auto i : *file->to_repack) {
+        fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                "Sending repack for %lu\n", i);
+        _compact_log(file, i, count, sync);
+    }
+
+    int ret = file->ops_kvssd->flush();
+    if(ret) {
+        fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                "Flushed %d in compact logs!\n", ret);
+    }
+
+    uint64_t sleep_count = 0;
+    while(atomic_get_uint64_t(count) > 0) {
+        usleep(1);
+        sleep_count++;
+
+        if(sleep_count == 100) {
+            file->ops_kvssd->flush();
+            sleep_count = 0;
+        }
+    }
+
+    delete count;
+
+    file->to_repack->clear();
+}
+
 int filemgr_is_writable(struct filemgr *file, bid_t bid)
 {
     if (sb_bmp_exists(file->sb) && sb_ops.is_writable) {
         // block reusing is enabled
         return sb_ops.is_writable(file, bid);
     } else {
-        uint64_t pos = bid * file->blocksize;
+        uint64_t pos;
+        if(file->config->kvssd) {
+            pos = bid;
+
+            uint64_t global_commitid, global_vernum;
+            uint64_t bid_commitid, bid_vernum;
+            filemgr_get_commitid_and_vernum(file, file->header.vernum, &global_commitid, &global_vernum);
+            filemgr_get_commitid_and_vernum(file, bid, &bid_commitid, &bid_vernum);
+
+            bool ret = 
+            (bid_commitid >= global_commitid && bid_vernum <= global_vernum);
+
+            return ret;
+        } else {
+            pos = bid * file->blocksize;
+
+            return (pos < atomic_get_uint64_t(&file->pos) &&
+                    pos >= atomic_get_uint64_t(&file->last_commit));
+        }
         // Note that we don't need to grab file->lock here because
         // 1) both file->pos and file->last_commit are only incremented.
         // 2) file->last_commit is updated using the value of file->pos,
         //    and always equal to or smaller than file->pos.
-        return (pos <  atomic_get_uint64_t(&file->pos) &&
-                pos >= atomic_get_uint64_t(&file->last_commit));
     }
 }
 
@@ -380,19 +1629,28 @@ static fdb_status _filemgr_read_header(struct filemgr *file,
     size_t min_filesize = 0;
 
     // get temp buffer
-    buf = (uint8_t *) _filemgr_get_temp_buf();
+    buf = (uint8_t *) get_buf();
 
     // If a header is found crc_mode can change to reflect the file
     if (file->crc_mode == CRC32) {
         check_crc32_open_rule = true;
     }
 
-    hdr_bid = atomic_get_uint64_t(&file->pos) / file->blocksize - 1;
+    if(file->config->kvssd) {
+        magic = FILEMGR_MAGIC_003;
+        retrieve(file, MILESTONE_K, &hdr_bid, NULL);
+    } else {
+        hdr_bid = atomic_get_uint64_t(&file->pos) / file->blocksize - 1;
+    }
     hdr_bid_local = hdr_bid;
 
     if (file->sb) {
         // superblock exists .. file size does not start from zero.
-        min_filesize = file->sb->config->num_sb * file->blocksize;
+        if(file->config->kvssd) {
+            min_filesize = file->sb->config->num_sb;
+        } else {
+            min_filesize = file->sb->config->num_sb * file->blocksize;
+        }
         bid_t sb_last_hdr_bid = atomic_get_uint64_t(&file->sb->last_hdr_bid);
         if (sb_last_hdr_bid != BLK_NOT_FOUND) {
             hdr_bid = hdr_bid_local = sb_last_hdr_bid;
@@ -402,31 +1660,34 @@ static fdb_status _filemgr_read_header(struct filemgr *file,
     }
 
     if (atomic_get_uint64_t(&file->pos) > min_filesize) {
-        // Crash Recovery Test 1: unaligned last block write
-        uint64_t remain = atomic_get_uint64_t(&file->pos) % file->blocksize;
-        if (remain) {
-            atomic_sub_uint64_t(&file->pos, remain);
-            atomic_store_uint64_t(&file->last_commit, atomic_get_uint64_t(&file->pos));
-            const char *msg = "Crash Detected: %" _F64 " non-block aligned bytes discarded "
-                "from a database file '%s'\n";
-            DBG(msg, remain, file->filename);
-            fdb_log(log_callback, FDB_LOG_WARNING,
-                    FDB_RESULT_READ_FAIL /* Need to add a better error code*/,
-                    msg, remain, file->filename);
+        if(!file->config->kvssd) {
+            // Crash Recovery Test 1: unaligned last block write
+            uint64_t remain = atomic_get_uint64_t(&file->pos) % file->blocksize;
+            if (remain) {
+                atomic_sub_uint64_t(&file->pos, remain);
+                atomic_store_uint64_t(&file->last_commit, atomic_get_uint64_t(&file->pos));
+                const char *msg = "Crash Detected: %" _F64 " non-block aligned bytes discarded "
+                    "from a database file '%s'\n";
+                DBG(msg, remain, file->filename);
+                fdb_log(log_callback, FDB_LOG_WARNING,
+                        FDB_RESULT_READ_FAIL /* Need to add a better error code*/,
+                        msg, remain, file->filename);
+            }
         }
 
         size_t block_counter = 0;
         do {
-            if (hdr_bid_local * file->blocksize >= file->pos) {
+            if (hdr_bid_local > file->pos) {
                 // Handling EOF scenario
                 status = FDB_RESULT_NO_DB_HEADERS;
                 const char *msg = "Unable to read block from file '%s' as EOF "
-                                  "reached\n";
+                    "reached\n";
                 fdb_log(log_callback, FDB_LOG_ERROR, status,
                         msg, file->filename);
                 break;
             }
-            ssize_t rv = filemgr_read_block(file, buf, hdr_bid_local);
+
+            ssize_t rv = filemgr_read_block(file, NULL, buf, hdr_bid_local);
             if (rv != (ssize_t)file->blocksize) {
                 status = (fdb_status) rv;
                 const char *msg = "Unable to read a database file '%s' with "
@@ -496,12 +1757,18 @@ static fdb_status _filemgr_read_header(struct filemgr *file,
                                 _endian_decode(file->header.revnum);
                             file->header.seqnum =
                                 _endian_decode(file->header.seqnum.load());
+
+                            if(file->config->kvssd &&
+                                file->header.revnum != file->header.vernum >> 32) {
+                                file->header.vernum = 0;
+                            }
+
                             file->header.size = len;
                             atomic_store_uint64_t(&file->header.bid, hdr_bid_local);
                             memset(&file->header.stat, 0x0, sizeof(file->header.stat));
 
                             // release temp buffer
-                            _filemgr_release_temp_buf(buf);
+                            put_buf(buf);
                         }
 
                         file->version = magic;
@@ -553,7 +1820,7 @@ static fdb_status _filemgr_read_header(struct filemgr *file,
     }
 
     // release temp buffer
-    _filemgr_release_temp_buf(buf);
+    put_buf(buf);
 
     file->header.size = 0;
     file->header.revnum = 0;
@@ -583,6 +1850,11 @@ uint64_t filemgr_get_bcache_used_space(void)
                           * global_config.blocksize;
     }
     return bcache_free_space;
+}
+
+uint64_t filemgr_get_kvcache_used_space(void)
+{
+    return kvcache_get_used_space();
 }
 
 struct filemgr_prefetch_args {
@@ -634,7 +1906,7 @@ static void *_filemgr_prefetch_thread(void *voidargs)
                 break;
             } else {
                 bid = i / args->file->blocksize;
-                if (filemgr_read(args->file, bid, buf, NULL, true)
+                if (filemgr_read(args->file, bid, buf, NULL, NULL, true)
                         != FDB_RESULT_SUCCESS) {
                     // 4. read failure
                     fdb_log(args->log_callback, FDB_LOG_ERROR, FDB_RESULT_READ_FAIL,
@@ -747,9 +2019,179 @@ struct filemgr* filemgr_get_instance(const char* filename)
     return file;
 }
 
+double _space_amp(struct filemgr *file)
+{
+    fdb_file_info info;
+
+    size_t datasize = _kvs_stat_get_sum(file, KVS_STAT_DATASIZE);
+    size_t ret = datasize;
+    ret += wal_get_datasize(file);
+    ret += atomic_get_uint64_t(&file->logs_occupied_space);
+
+    size_t wal_docs = wal_get_num_docs(file);
+    size_t wal_deletes = wal_get_num_deletes(file);
+    size_t wal_n_inserts = wal_docs - wal_deletes;
+
+    size_t ndocs = _kvs_stat_get_sum(file, KVS_STAT_NDOCS);
+
+    if (ndocs + wal_n_inserts < wal_deletes) {
+        info.doc_count = 0;
+    } else {
+        if (ndocs) {
+            info.doc_count = ndocs + wal_n_inserts - wal_deletes;
+        } else {
+            info.doc_count = wal_n_inserts;
+        }
+    }
+
+    size_t ndeletes = _kvs_stat_get_sum(file, KVS_STAT_NDELETES);
+    if (ndeletes) { // not accurate since some ndeletes may be wal_deletes
+        info.deleted_count = ndeletes + wal_deletes;
+    } else { // this is accurate since it reflects only wal_ndeletes
+        info.deleted_count = wal_deletes;
+    }
+
+    info.space_used = ret; 
+    
+    return (double) info.space_used / info.file_size;
+}
+
+void __pair_delete_cb(struct filemgr *file) {
+    atomic_sub_uint64_t(&file->data_in_kvssd, VALUE_RETRIEVE_LENGTH - 1024 + sizeof(uint64_t));
+}
+
+#ifndef __KVSSD_EMU
+void _pair_delete_cb(struct nvme_passthru_kv_cmd cmd, void *voidargs)
+{
+    struct callback_args *kvssd_cb_args;
+    struct filemgr *file;
+
+    kvssd_cb_args = (struct callback_args*)voidargs;
+    file = (struct filemgr*)kvssd_cb_args->args;
+
+    __pair_delete_cb(file);
+
+    assert(cmd.result == 0);
+    free(kvssd_cb_args);
+}
+#else
+void _pair_delete_cb(kvs_postprocess_context* ioctx) 
+{
+    struct callback_args *cb_args;
+    struct filemgr *file;
+
+    cb_args = (struct callback_args*)ioctx->private1;
+    file = (struct filemgr*)cb_args->args;
+
+    __pair_delete_cb(file);
+    _ioctx_free_func(ioctx, true, true);
+    free(cb_args);
+}
+#endif
+
+std::mutex deleted_lock;
+std::unordered_set<uint64_t> deleted;
+void *_pair_delete_thread(void* voidargs) {
+    struct filemgr *file;
+    uint64_t vernum = BLK_NOT_FOUND;
+    struct callback_args *kvssd_cb_args;
+
+    file = (struct filemgr*)voidargs;
+
+    while(1) {
+        file->open_snapshots_lock.lock();
+        if(file->open_snapshots->size() > 0) {
+            file->open_snapshots_lock.unlock();
+            sleep(1);
+            continue;
+        }
+        file->open_snapshots_lock.unlock();
+
+        file->pairs_to_remove->wait_dequeue_timed(vernum, 
+                                                  std::chrono::seconds(1));
+
+        if(vernum == BLK_NOT_FOUND) {
+            fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                    "Delete queue empty");
+            goto shutdown;
+        } else if(0 && file->pairs_to_remove->size_approx() == 0) {
+            atomic_store_uint8_t(&file->deletes_done, 1);
+            goto shutdown;
+        }
+
+       fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                "Sending delete for %lu (%lu %lu)", 
+                vernum, vernum >> 32, vernum & 0xFFFFFFFF);
+
+        kvssd_cb_args =
+        (struct callback_args*)malloc(sizeof(struct callback_args));
+        kvssd_cb_args->args = (void*) file;
+        kvssd_cb_args->cb = _pair_delete_cb;
+        del(file, vernum, kvssd_cb_args);
+        vernum = BLK_NOT_FOUND;
+
+        _kvs_stat_update_attr(file, 0,
+                KVS_STAT_DATASIZE, -2000);
+
+shutdown:
+        if(atomic_get_uint8_t(&file->flush_shutdown)) {
+            if(file->pairs_to_remove->size_approx() > 0) {
+                continue;
+            }
+            return NULL;
+        }
+    }
+
+    return NULL;
+}
+
+#include "btree.h"
+void * _log_flush_thread(void *voidargs) {
+    struct filemgr *file;
+    bool just_flushed;
+
+    file = (struct filemgr*)voidargs;
+    just_flushed = false;
+
+start:
+    std::unique_lock<std::mutex> lock(file->flush_lock);
+    while(!file->ready) {
+        file->flush_cond.wait_for(lock, std::chrono::seconds(1));
+
+        if(atomic_get_uint8_t(&file->flush_shutdown)) {
+            atomic_store_uint8_t(&file->flushing, 0);
+            return NULL;
+        }
+    }
+
+    assert(atomic_get_uint8_t(&file->flushing) == 0);
+    atomic_store_uint8_t(&file->flushing, 1);
+
+    mutex_lock(&file->outstanding_log_lock);
+    auto logs_to_flush = *file->outstanding_logs;
+    filemgr_clear_logs(file);
+    mutex_unlock(&file->outstanding_log_lock);
+    file->log_flushing = true;
+    filemgr_write_logs(file, false, logs_to_flush);
+    filemgr_compact_logs(file, false);
+    file->log_flushing = false;
+    file->ready = false;
+
+    atomic_store_uint8_t(&file->flushing, 0);
+    lock.unlock();
+
+    if(atomic_get_uint8_t(&file->flush_shutdown)) {
+        return NULL;
+    }
+
+    goto start;
+
+    return NULL;
+}
+
 filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
-                                 struct filemgr_config *config,
-                                 err_log_callback *log_callback)
+        struct filemgr_config *config,
+        err_log_callback *log_callback)
 {
     struct filemgr *file = NULL;
     struct filemgr query;
@@ -762,7 +2204,9 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
 
     filemgr_init(config);
 
-    if (config->encryption_key.algorithm != FDB_ENCRYPTION_NONE && global_config.ncacheblock <= 0) {
+    if (config->encryption_key.algorithm != FDB_ENCRYPTION_NONE 
+            && global_config.ncacheblock <= 0
+            && global_config.kv_cache_size <= 0) {
         // cannot use encryption without a block cache
         result.rv = FDB_RESULT_CRYPTO_ERROR;
         return result;
@@ -778,7 +2222,8 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
         file = _get_entry(e, struct filemgr, e);
 
         if (atomic_incr_uint32_t(&file->ref_count) > 1 &&
-            atomic_get_uint8_t(&file->status) != FILE_CLOSED) {
+                atomic_get_uint8_t(&file->status) != FILE_CLOSED) {
+            file->ops_kvssd->open("/dev/nvme0n1", NULL);
             spin_unlock(&filemgr_openlock);
             result.file = file;
             result.rv = FDB_RESULT_SUCCESS;
@@ -794,9 +2239,13 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
             }
             *file->config = *config;
             file->config->blocksize = global_config.blocksize;
+            file->config->index_blocksize = global_config.index_blocksize;
             file->config->ncacheblock = global_config.ncacheblock;
             file_flag |= config->flag;
             file->fd = file->ops->open(file->filename, file_flag, 0666);
+            if(file->config->kvssd) {
+                file->ops_kvssd->open("/dev/nvme0n1", NULL);
+            }
             if (file->fd < 0) {
                 if (file->fd == FDB_RESULT_NO_SUCH_FILE) {
                     // A database file was manually deleted by the user.
@@ -808,6 +2257,8 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
                     ret = hash_remove(&hash, &file->e);
                     fdb_assert(ret, 0, 0);
                     filemgr_free_func(&file->e);
+                    // free(file);
+                    // file->ops_kvssd->close();
                     if (!create) {
                         _log_errno_str(ops, log_callback,
                                 FDB_RESULT_NO_SUCH_FILE, "OPEN", filename);
@@ -817,7 +2268,7 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
                     }
                 } else {
                     _log_errno_str(file->ops, log_callback,
-                                  (fdb_status)file->fd, "OPEN", filename);
+                            (fdb_status)file->fd, "OPEN", filename);
                     atomic_decr_uint32_t(&file->ref_count);
                     spin_unlock(&file->lock);
                     spin_unlock(&filemgr_openlock);
@@ -872,6 +2323,21 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
     file->filename = (char*)malloc(file->filename_len + 1);
     strcpy(file->filename, filename);
 
+#ifndef __KVSSD_EMU
+    set_n_aio(global_config.num_aio_workers);
+    set_qd(global_config.max_outstanding);
+#endif
+
+    if(config->kvssd) {
+        file->ops_kvssd = get_filemgr_ops_kvssd();
+#ifdef __KVSSD_EMU
+        file->ops_kvssd->open(config->kvssd_dev_path, 
+                              config->kvssd_emu_config_file);
+#else
+        file->ops_kvssd->open("/dev/nvme0n1", NULL);
+#endif
+    }
+
     atomic_init_uint32_t(&file->ref_count, 1);
     file->stale_list = NULL;
 
@@ -889,16 +2355,47 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
 
     file->ops = ops;
     file->blocksize = global_config.blocksize;
+    file->index_blocksize = global_config.index_blocksize;
     atomic_init_uint8_t(&file->status, FILE_NORMAL);
     file->config = (struct filemgr_config*)malloc(sizeof(struct filemgr_config));
     *file->config = *config;
     file->config->blocksize = global_config.blocksize;
+    file->config->index_blocksize = global_config.index_blocksize;
     file->config->ncacheblock = global_config.ncacheblock;
     file->old_filename = NULL;
     file->new_filename = NULL;
     file->fd = fd;
+    file->config->kvssd = global_config.kvssd;
+    file->config->kv_cache_size = global_config.kv_cache_size;
+    file->config->split_threshold = global_config.split_threshold;
+    file->config->max_log_threshold = global_config.max_log_threshold;
+    file->config->max_outstanding = global_config.max_outstanding;
+    file->config->kvssd_retrieve_length = global_config.kvssd_retrieve_length;
+    file->config->num_aio_workers = global_config.num_aio_workers;
+    file->config->max_logs_per_node = global_config.max_logs_per_node;
 
-    cs_off_t offset = file->ops->goto_eof(file->fd);
+    VALUE_RETRIEVE_LENGTH = file->config->kvssd_retrieve_length + 1024;
+    if(VALUE_RETRIEVE_LENGTH > MAX_VALUE_SIZE) {
+        VALUE_RETRIEVE_LENGTH = MAX_VALUE_SIZE;
+    }
+    LOG_RETRIEVE_LENGTH = global_config.index_blocksize;
+    MAX_ENTRIES_PER_LOG_WRITE = (LOG_RETRIEVE_LENGTH - log_meta_length) / log_entry_size;
+    MAX_OUTSTANDING_REQUESTS = file->config->max_outstanding;
+
+    fdb_log(NULL, FDB_LOG_INFO, FDB_RESULT_SUCCESS,
+            "Number of AIO workers: %u\n", file->config->num_aio_workers);
+    fdb_log(NULL, FDB_LOG_INFO, FDB_RESULT_SUCCESS,
+            "Number of max outstanding requests: %u\n", MAX_OUTSTANDING_REQUESTS);
+
+    cs_off_t offset = 0;
+    if(config->kvssd) {
+        retrieve(file, MILESTONE_K, &offset, NULL);
+        filemgr_set_vernum(file, offset);
+        atomic_store_uint64_t(&file->pos, offset + 1);
+    } else {
+        offset = file->ops->goto_eof(file->fd);
+    }
+
     if (offset < 0) {
         _log_errno_str(file->ops, log_callback, (fdb_status) offset, "SEEK_END", filename);
         file->ops->close(file->fd);
@@ -916,6 +2413,47 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
     atomic_init_uint32_t(&file->throttling_delay, 0);
     atomic_init_uint64_t(&file->num_invalidated_blocks, 0);
     atomic_init_uint8_t(&file->io_in_prog, 0);
+    atomic_init_uint64_t(&file->btree_handle_idx, 0);
+
+    file->max_pending_handles = MAX_OUTSTANDING_REQUESTS;
+    atomic_init_uint64_t(&file->busy_handles_idx, 0);
+    atomic_init_uint64_t(&file->finished_handles, 0);
+    atomic_init_uint64_t(&file->sent_handles, 1);
+
+    file->open_snapshots = new std::unordered_set<uint64_t>();
+    file->sync_mode = 0;
+
+    atomic_init_uint8_t(&file->flushing, 0);
+
+    file->writes_this_commit = 0;
+
+    atomic_init_uint8_t(&file->flush_shutdown, 0);
+    file->outstanding_logs = new std::unordered_map<uint64_t, std::string>();
+    file->entries_per_node = new std::unordered_map<uint64_t, int16_t>();
+    file->to_repack = new std::vector<uint64_t>();
+
+    file->logs_to_remove = new std::deque<uint64_t>();
+    file->pairs_to_remove = 
+    new BlockingConcurrentQueue<uint64_t>(128);
+ 
+    thread_create(&file->flush_thread, _log_flush_thread, (void*) file);
+    thread_create(&file->pair_del_thread, _pair_delete_thread, (void*) file);
+
+    void *buf = malloc(sizeof(uint64_t));
+    memset(buf, 0x0, sizeof(uint64_t));
+    retrieve(file, "DATA", buf, NULL);
+    atomic_store_uint64_t(&file->data_in_kvssd, *(uint64_t*) buf);
+    memset(buf, 0x0, sizeof(uint64_t));
+    retrieve(file, "UDATA", buf, NULL);
+    atomic_store_uint64_t(&file->user_data , *(uint64_t*) buf);
+    free(buf);
+
+    mutex_init(&file->entries_lock);
+    mutex_init(&file->logs_per_node_lock);
+    mutex_init(&file->outstanding_log_lock);
+    prefix.i = -1;
+    file->logs_per_node = new std::map<uint64_t, uint64_t>();
+    file->this_flush_leaves_updated = new std::unordered_set<uint64_t>();
 
 #ifdef _LATENCY_STATS
     for (int i = 0; i < FDB_LATENCY_NUM_STATS; ++i) {
@@ -924,6 +2462,7 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
 #endif // _LATENCY_STATS
 
     file->bcache = NULL;
+    file->kvcache = NULL;
     file->in_place_compaction = false;
     file->kv_header = NULL;
     atomic_init_uint8_t(&file->prefetch_status, FILEMGR_PREFETCH_IDLE);
@@ -956,6 +2495,8 @@ filemgr_open_result filemgr_open(char *filename, struct filemgr_ops *ops,
     pops.unlock_internal = spin_unlock_wrap;
     pops.destroy_internal = spin_destroy_wrap;
     pops.is_overlapped = _block_is_overlapped;
+    (void)_block_is_overlapped;
+    (void)_addr_is_overlapped;
 
     memset(&pconfig, 0x0, sizeof(pconfig));
     pconfig.ops = &pops;
@@ -1097,6 +2638,11 @@ uint64_t filemgr_update_header(struct filemgr *file,
     file->header.size = len;
     if (inc_revnum) {
         ++(file->header.revnum);
+
+        if(file->config->kvssd) {
+            filemgr_set_vernum(file, file->header.revnum << 32);
+        }
+
     }
     ret = file->header.revnum;
 
@@ -1125,6 +2671,37 @@ fdb_seqnum_t filemgr_get_seqnum(struct filemgr *file)
 void filemgr_set_seqnum(struct filemgr *file, fdb_seqnum_t seqnum)
 {
     file->header.seqnum = seqnum;
+}
+
+fdb_seqnum_t filemgr_assign_new_seqnum(struct filemgr *file)
+{
+    return atomic_incr_uint64_t(&file->header.seqnum);
+}
+
+fdb_seqnum_t filemgr_get_current_vernum(struct filemgr *file)
+{
+   return (file->header.revnum << 32) | file->header.vernum;
+}
+
+fdb_seqnum_t filemgr_assign_new_vernum(struct filemgr *file)
+{
+    spin_lock(&file->lock);
+    uint64_t revnum = file->header.revnum << 32;
+    uint64_t vernum = atomic_incr_uint64_t(&file->header.vernum);
+    spin_unlock(&file->lock);
+
+    return revnum | vernum;
+}
+
+void filemgr_set_vernum(struct filemgr *file, fdb_seqnum_t vernum)
+{
+   file->header.vernum = vernum;
+}
+
+void filemgr_get_commitid_and_vernum(struct filemgr *file, uint64_t vernum,
+                                     uint64_t *commitid, uint64_t *seqnum) {
+    *commitid = vernum >> 32;
+    *seqnum = vernum & 0xFFFFFFFF;
 }
 
 void* filemgr_get_header(struct filemgr *file, void *buf, size_t *len,
@@ -1179,15 +2756,15 @@ fdb_status filemgr_fetch_header(struct filemgr *file, uint64_t bid,
         return FDB_RESULT_SUCCESS;
     }
 
-    _buf = (uint8_t *)_filemgr_get_temp_buf();
+    _buf = (uint8_t *)get_buf();
 
-    status = filemgr_read(file, (bid_t)bid, _buf, log_callback, true);
+    status = filemgr_read(file, (bid_t)bid, _buf, NULL, log_callback, true);
 
     if (status != FDB_RESULT_SUCCESS) {
         fdb_log(log_callback, FDB_LOG_WARNING, status,
                 "Failed to read a database header with block id %" _F64 " in "
                 "a database file '%s'", bid, file->filename);
-        _filemgr_release_temp_buf(_buf);
+        put_buf(_buf);
         return status;
     }
     memcpy(marker, _buf + file->blocksize - BLK_MARKER_SIZE,
@@ -1203,7 +2780,7 @@ fdb_status filemgr_fetch_header(struct filemgr *file, uint64_t bid,
                 "a database file '%s' does NOT match BLK_MARKER_DBHEADER!",
                 bid, file->filename);
         */
-        _filemgr_release_temp_buf(_buf);
+        put_buf(_buf);
         return FDB_RESULT_READ_FAIL;
     }
     memcpy(&magic,
@@ -1216,7 +2793,7 @@ fdb_status filemgr_fetch_header(struct filemgr *file, uint64_t bid,
                 "id %" _F64 " in a database file '%s'"
                 "does NOT match FILEMGR_MAGIC %" _F64 "!",
                 magic, bid, file->filename, ver_get_latest_magic());
-        _filemgr_release_temp_buf(_buf);
+        put_buf(_buf);
         return FDB_RESULT_FILE_CORRUPTION;
     }
     memcpy(&hdr_len,
@@ -1258,7 +2835,7 @@ fdb_status filemgr_fetch_header(struct filemgr *file, uint64_t bid,
         *sb_bmp_revnum = _endian_decode(_bmp_revnum);
     }
 
-    _filemgr_release_temp_buf(_buf);
+    put_buf(_buf);
 
     return status;
 }
@@ -1286,14 +2863,14 @@ uint64_t filemgr_fetch_prev_header(struct filemgr *file, uint64_t bid,
         // No other header available
         return bid;
     }
-    _buf = (uint8_t *)_filemgr_get_temp_buf();
+    _buf = (uint8_t *)get_buf();
 
     // Reverse scan the file for a previous DB header
     do {
         // Get prev_bid from the current header.
         // Since the current header is already cached during the previous
         // operation, no disk I/O will be triggered.
-        if (filemgr_read(file, (bid_t)bid, _buf, log_callback, true)
+        if (filemgr_read(file, (bid_t)bid, _buf, NULL, log_callback, true)
                 != FDB_RESULT_SUCCESS) {
             break;
         }
@@ -1348,7 +2925,7 @@ uint64_t filemgr_fetch_prev_header(struct filemgr *file, uint64_t bid,
         }
 
         // Read the prev header
-        fdb_status fs = filemgr_read(file, (bid_t)bid, _buf, log_callback, true);
+        fdb_status fs = filemgr_read(file, (bid_t)bid, _buf, NULL, log_callback, true);
         if (fs != FDB_RESULT_SUCCESS) {
             fdb_log(log_callback, FDB_LOG_WARNING, fs,
                     "Failed to read a previous database header with block id %"
@@ -1438,7 +3015,7 @@ uint64_t filemgr_fetch_prev_header(struct filemgr *file, uint64_t bid,
         bid = BLK_NOT_FOUND;
     }
 
-    _filemgr_release_temp_buf(_buf);
+    put_buf(_buf);
 
     return bid;
 }
@@ -1465,11 +3042,19 @@ fdb_status filemgr_close(struct filemgr *file, bool cleanup_cache_onclose,
     // remove filemgr structure if no thread refers to the file
     spin_lock(&file->lock);
     if (atomic_get_uint32_t(&file->ref_count) == 0) {
-        if (global_config.ncacheblock > 0 &&
+        if ((global_config.ncacheblock > 0 || (global_config.kv_cache_size > 0)) &&
             atomic_get_uint8_t(&file->status) != FILE_REMOVED_PENDING) {
+
             spin_unlock(&file->lock);
-            // discard all dirty blocks belonged to this file
-            bcache_remove_dirty_blocks(file);
+            if(global_config.ncacheblock > 0) {
+                // discard all dirty blocks belonged to this file
+                bcache_remove_dirty_blocks(file);
+            }
+
+            if(global_config.kv_cache_size > 0) {
+                // discard all dirty blocks belonged to this file
+                kvcache_flush(file);
+            }
         } else {
             // If the file is in pending removal (i.e., FILE_REMOVED_PENDING),
             // then its dirty block entries will be cleaned up in either
@@ -1484,7 +3069,44 @@ fdb_status filemgr_close(struct filemgr *file, bool cleanup_cache_onclose,
         filemgr_dump_latency_stat(file, log_callback);
 #endif // _LATENCY_STATS_DUMP_TO_FILE
 
+        while(atomic_cas_uint8_t(&file->flushing, 0, 1) == 0) {
+            usleep(1);
+        }
+
+        auto logs_to_flush = *file->outstanding_logs;
+        filemgr_write_logs(file, false, logs_to_flush);
+        filemgr_compact_logs(file, false);
+
+        atomic_store_uint8_t(&file->flushing, 0);
+
+        atomic_store_uint8_t(&file->flush_shutdown, 1);
+        while(atomic_get_uint8_t(&file->flushing) == 1) {
+            usleep(1);
+        }
+
+        _signal_flush(file);
+        thread_join(file->flush_thread, NULL);
+        atomic_store_uint8_t(&file->log_del_shutdown, 1);
+        thread_join(file->flush_thread, NULL);
+        thread_join(file->pair_del_thread, NULL);
+
+        auto data = atomic_get_uint64_t(&file->data_in_kvssd);
+        store(file, "DATA", &data, sizeof(uint64_t), NULL);
+        auto udata = atomic_get_uint64_t(&file->user_data);
+        store(file, "UDATA", &udata, sizeof(uint64_t), NULL);
+
         spin_lock(&file->lock);
+        file->ops_kvssd->flush();
+
+        delete file->open_snapshots;
+        delete file->to_repack;
+        delete file->outstanding_logs;
+        delete file->logs_to_remove;
+        delete file->pairs_to_remove;
+        delete file->entries_per_node;
+        delete file->logs_per_node;
+
+        delete file->this_flush_leaves_updated;
 
         if (atomic_get_uint8_t(&file->status) == FILE_REMOVED_PENDING) {
 
@@ -1505,7 +3127,11 @@ fdb_status filemgr_close(struct filemgr *file, bool cleanup_cache_onclose,
 
                 // As the file is already unlinked, the file will be removed
                 // as soon as we close it.
-                rv = file->ops->close(file->fd);
+                if(file->config->kvssd) {
+                    rv = file->ops_kvssd->close();
+                } else {
+                    rv = file->ops->close(file->fd);
+                }
                 _log_errno_str(file->ops, log_callback, (fdb_status)rv, "CLOSE", file->filename);
 #if defined(WIN32) || defined(_WIN32)
                 // For Windows, we need to manually remove the file.
@@ -1528,8 +3154,10 @@ fdb_status filemgr_close(struct filemgr *file, bool cleanup_cache_onclose,
             }
             return (fdb_status) rv;
         } else {
+            if(!file->config->kvssd) {
+                rv = file->ops->close(file->fd);
+            }
 
-            rv = file->ops->close(file->fd);
             if (cleanup_cache_onclose) {
                 _log_errno_str(file->ops, log_callback, (fdb_status)rv, "CLOSE", file->filename);
                 if (file->in_place_compaction && orig_file_name) {
@@ -1578,15 +3206,19 @@ fdb_status filemgr_close(struct filemgr *file, bool cleanup_cache_onclose,
                 spin_unlock(&filemgr_openlock);
 
                 filemgr_free_func(&file->e);
+
                 return (fdb_status) rv;
             } else {
                 atomic_store_uint8_t(&file->status, FILE_CLOSED);
+            }
+
+            if(file->config->kvssd) {
+                rv = file->ops_kvssd->close();
             }
         }
     }
 
     _log_errno_str(file->ops, log_callback, (fdb_status)rv, "CLOSE", file->filename);
-
     spin_unlock(&file->lock);
     spin_unlock(&filemgr_openlock);
     return (fdb_status) rv;
@@ -1620,7 +3252,20 @@ void filemgr_free_func(struct hash_elem *h)
         thread_join(file->prefetch_tid, &ret);
     }
 
+
+    if(file->config->kvssd) {
+        file->ops_kvssd->close();
+    }
+
     // remove all cached blocks
+    if (global_config.kv_cache_size > 0 &&
+            file->kvcache.load(std::memory_order_relaxed)) {
+        kvcache_flush(file);
+        kvcache_remove_clean_blocks(file);
+        kvcache_remove_file(file);
+        file->kvcache.store(NULL, std::memory_order_relaxed);
+    }
+
     if (global_config.ncacheblock > 0 &&
             file->bcache.load(std::memory_order_relaxed)) {
         bcache_remove_dirty_blocks(file);
@@ -1690,7 +3335,6 @@ void filemgr_free_func(struct hash_elem *h)
     // free fhandle idx
     _free_fhandle_idx(&file->fhandle_idx);
     spin_destroy(&file->fhandle_idx_lock);
-
     // free file structure
     struct list *stale_list = filemgr_get_stale_list(file);
     filemgr_clear_stale_list(file);
@@ -1773,10 +3417,13 @@ fdb_status filemgr_shutdown()
         spin_unlock(&filemgr_openlock);
         if (!open_file) {
             hash_free_active(&hash, filemgr_free_func);
+            if(global_config.kv_cache_size > 0) {
+                kvcache_shutdown();
+            }
+
             if (global_config.ncacheblock > 0) {
                 bcache_shutdown();
             }
-            _filemgr_shutdown_temp_buf();
             spin_unlock(&initial_lock);
             filemgr_initialized = 0;
 
@@ -1796,30 +3443,42 @@ fdb_status filemgr_shutdown()
 
 bid_t filemgr_alloc(struct filemgr *file, err_log_callback *log_callback)
 {
-    spin_lock(&file->lock);
     bid_t bid = BLK_NOT_FOUND;
 
-    // block reusing is not allowed for being compacted file
-    // for easy implementation.
-    if (filemgr_get_file_status(file) == FILE_NORMAL &&
-        file->sb && sb_ops.alloc_block) {
-        bid = sb_ops.alloc_block(file);
-    }
-    if (bid == BLK_NOT_FOUND) {
-        bid = atomic_get_uint64_t(&file->pos) / file->blocksize;
-        atomic_add_uint64_t(&file->pos, file->blocksize);
+    if(!file->config->kvssd) {
+        spin_lock(&file->lock);
     }
 
-    if (global_config.ncacheblock <= 0) {
-        // if block cache is turned off, write the allocated block before use
-        uint8_t _buf = 0x0;
-        ssize_t rv = file->ops->pwrite(file->fd, &_buf, 1,
-                                       (bid+1) * file->blocksize - 1);
-        _log_errno_str(file->ops, log_callback, (fdb_status) rv, "WRITE", file->filename);
-    }
-    spin_unlock(&file->lock);
+    if(file->config->kvssd) {
+        bid = filemgr_assign_new_vernum(file);
+        atomic_incr_uint64_t(&file->pos);
+        return bid;
+    } else {
+        assert(0);
+        // block reusing is not allowed for being compacted file
+        // for easy implementation.
+        if (filemgr_get_file_status(file) == FILE_NORMAL &&
+            file->sb && sb_ops.alloc_block) {
+            bid = sb_ops.alloc_block(file);
+        }
+        if (bid == BLK_NOT_FOUND) {
+            bid = atomic_get_uint64_t(&file->pos) / file->blocksize;
+            atomic_add_uint64_t(&file->pos, file->blocksize);
+        } else {
+        }
 
-    return bid;
+        if (global_config.ncacheblock <= 0) {
+            // if block cache is turned off, write the allocated block before use
+            uint8_t _buf = 0x0;
+            ssize_t rv = file->ops->pwrite(file->fd, &_buf, 1,
+                                           (bid+1) * file->blocksize - 1);
+            _log_errno_str(file->ops, log_callback, (fdb_status) rv, "WRITE", file->filename);
+        }
+
+        spin_unlock(&file->lock);
+
+        return bid;
+    }
 }
 
 // Note that both alloc_multiple & alloc_multiple_cond are not used in
@@ -1827,6 +3486,7 @@ bid_t filemgr_alloc(struct filemgr *file, err_log_callback *log_callback)
 void filemgr_alloc_multiple(struct filemgr *file, int nblock, bid_t *begin,
                             bid_t *end, err_log_callback *log_callback)
 {
+    assert(0);
     spin_lock(&file->lock);
     *begin = atomic_get_uint64_t(&file->pos) / file->blocksize;
     *end = *begin + nblock - 1;
@@ -1847,6 +3507,7 @@ bid_t filemgr_alloc_multiple_cond(struct filemgr *file, bid_t nextbid, int nbloc
                                   bid_t *begin, bid_t *end,
                                   err_log_callback *log_callback)
 {
+    assert(0);
     bid_t bid;
     spin_lock(&file->lock);
     bid = atomic_get_uint64_t(&file->pos) / file->blocksize;
@@ -1887,10 +3548,27 @@ INLINE fdb_status _filemgr_crc32_check(struct filemgr *file, void *buf)
     return FDB_RESULT_SUCCESS;
 }
 
+INLINE fdb_status _filemgr_crc32_bnode_check_with_len(struct filemgr *file, void *buf, 
+                                                      uint64_t len)
+{
+    uint32_t crc_file = 0;
+    memcpy(&crc_file, (uint8_t *) buf + BTREE_CRC_OFFSET, sizeof(crc_file));
+    crc_file = _endian_decode(crc_file);
+
+    memset((uint8_t *) buf + BTREE_CRC_OFFSET, 0xff, BTREE_CRC_FIELD_LEN);
+    if (!perform_integrity_check(reinterpret_cast<const uint8_t*>(buf),
+                                 len,
+                                 crc_file,
+                                 file->crc_mode)) {
+        return FDB_RESULT_CHECKSUM_ERROR;
+    }
+    return FDB_RESULT_SUCCESS;
+}
+
 bool filemgr_invalidate_block(struct filemgr *file, bid_t bid)
 {
     bool ret;
-    if (atomic_get_uint64_t(&file->last_commit) < bid * file->blocksize) {
+    if (atomic_get_uint64_t(&file->last_commit) < bid) {
         ret = true; // block invalidated was allocated recently (uncommitted)
     } else {
         ret = false; // a block from the past is invalidated (committed)
@@ -1922,6 +3600,19 @@ uint64_t filemgr_flush_immutable(struct filemgr *file,
                                    err_log_callback *log_callback)
 {
     uint64_t ret = 0;
+
+    if(global_config.kv_cache_size > 0) {
+        if (atomic_get_uint8_t(&file->io_in_prog)) {
+            return 0;
+        }
+        fdb_status rv = kvcache_flush(file);
+        if (rv != FDB_RESULT_SUCCESS) {
+            _log_errno_str(file->ops, log_callback, (fdb_status)rv, "WRITE",
+                           file->filename);
+        }
+        return 0;
+    }
+
     if (global_config.ncacheblock > 0) {
         if (atomic_get_uint8_t(&file->io_in_prog)) {
             return 0;
@@ -1941,25 +3632,248 @@ uint64_t filemgr_flush_immutable(struct filemgr *file,
     return ret;
 }
 
-fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
-                        err_log_callback *log_callback,
-                        bool read_on_cache_miss)
+idx_t filemgr_find_bnode_entry(struct filemgr *file, struct bnode *node, void *key) {
+    int ksize = file->config->bnode_ksize;
+    int vsize = file->config->bnode_vsize;
+
+    idx_t start, end, middle;
+    uint8_t *k = alca(uint8_t, ksize);
+    int cmp;
+#ifdef __BIT_CMP
+    idx_t *_map1[3] = {&end, &start, &start};
+    idx_t *_map2[3] = {&temp, &end, &temp};
+#endif
+
+    memset(k, 0, ksize);
+
+    start = middle = 0;
+    end = node->nentry;
+
+    if (end > 0) {
+        // compare with smallest key
+        memcpy(k, (uint8_t*)node->data + 0*(ksize+vsize), ksize);
+
+        // smaller than smallest key
+        if (_cmp_binary64(key, k, NULL) < 0) {
+        // if (_cmp_uint64_t(key, k, NULL) < 0) {
+            return BTREE_IDX_NOT_FOUND;
+        }
+
+        // compare with largest key
+        memcpy(k, (uint8_t*)node->data + (end-1)*(ksize+vsize), ksize);
+        // larger than largest key
+        if (_cmp_binary64(key, k, NULL) >= 0) {
+        // if (_cmp_uint64_t(key, k, NULL) >= 0) {
+            return end-1;
+        }
+
+        // binary search
+        while(start+1 < end) {
+            middle = (start + end) >> 1;
+
+            // get key at middle
+            memcpy(k, (uint8_t*)node->data + middle*(ksize+vsize), ksize);
+            cmp = _cmp_binary64(key, k, NULL);
+            // cmp = _cmp_uint64_t(key, k, NULL);
+
+#ifdef __BIT_CMP
+            cmp = _MAP(cmp) + 1;
+            *_map1[cmp] = middle;
+            *_map2[cmp] = 0;
+#else
+            if (cmp < 0) end = middle;
+                else if (cmp > 0) start = middle;
+                else {
+                    //if (btree->kv_ops->free_kv_var) btree->kv_ops->free_kv_var(btree, k, NULL);
+                    return middle;
+                }
+#endif
+        }
+        return start;
+    }
+    return BTREE_IDX_NOT_FOUND;
+
+}
+
+bool filemgr_merge_bnode_with_log(struct filemgr *file, struct bnode *node, 
+                                  char* key, uint64_t int_value) {
+    int ksize = file->config->bnode_ksize;
+    int vsize = file->config->bnode_vsize;
+    int kvsize = ksize + vsize;
+
+    idx_t idx, idx_insert;
+    uint8_t *k = alca(uint8_t, ksize);
+    void *ptr = node->data;
+    uint32_t nentry;
+    uint32_t bnode_len = _get_bnode_write_len((void*)node, &nentry, false);
+
+    void *value = (void*)malloc(vsize);
+    memcpy(value, &int_value, vsize);
+
+    memset(k, 0, ksize);
+
+    idx = filemgr_find_bnode_entry(file, node, key);
+
+    if (idx == BTREE_IDX_NOT_FOUND) idx_insert = 0;
+    else {
+        memcpy(k, (uint8_t*)ptr + idx * kvsize, ksize);
+        if (!_cmp_binary64(key, k, NULL)) {
+            // if same key already exists -> update its value
+            memcpy((uint8_t *)ptr + idx * kvsize + ksize, value, vsize);
+            free(value);
+            return true;
+        } else {
+            idx_insert = idx + 1;
+        }
+    }
+
+    if (bnode_len + kvsize > file->index_blocksize) {
+        printf("Too many entries node %lu!\n", node->bid);
+        assert(0);
+    }
+    
+    if (idx_insert < nentry) {
+        memmove(
+                (uint8_t *)ptr + (idx_insert+1)*kvsize,
+                (uint8_t *)ptr + idx_insert*kvsize,
+                (nentry - idx_insert)*kvsize);
+        memcpy((uint8_t *)ptr + idx_insert*kvsize, key, ksize);
+        memcpy((uint8_t *)ptr + idx_insert*kvsize + ksize, value, vsize);
+    } else {
+        memcpy((uint8_t *)ptr + idx_insert * kvsize, key, ksize);
+        memcpy((uint8_t *)ptr + idx_insert * kvsize + ksize, value, vsize);
+    }
+    node->nentry++;
+
+    free(value);
+
+    return true;
+}
+
+void filemgr_collect_node(struct filemgr *file, uint64_t bid, void *node_addr)
+{
+    uint16_t level;
+    struct bnode* node = _init_bnode(bid, node_addr);
+    std::string *latest_log;
+
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "Collecting node for bid %lu\n",
+            bid);
+
+    latest_log = new std::string();
+    mutex_lock(&file->outstanding_log_lock);
+    auto it = file->outstanding_logs->find(bid);
+    if(it != file->outstanding_logs->end()) {
+        *latest_log = it->second;
+    }
+    mutex_unlock(&file->outstanding_log_lock);
+
+    auto log = _filemgr_collect_logs(file, bid, &level, latest_log, NULL, NULL, false);
+
+    for(auto &i: log) {
+        filemgr_merge_bnode_with_log(file, node, 
+                                     (char*)i.first.c_str(), i.second);
+    }
+
+    node->kvsize = _endian_encode(node->kvsize);
+    node->flag = _endian_encode(node->flag);
+    node->level = level;
+    node->level = _endian_encode(node->level);
+    node->nentry = _endian_encode(node->nentry);
+
+    if(node->nentry == 0) {
+        fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                "0 entries for log bid %lu\n", bid);
+    }
+
+    if(node->level == 1) {
+        file->this_flush_leaf_reads++;
+    } else {
+        file->this_flush_inner_reads++;
+    }
+
+    mutex_lock(&file->entries_lock);
+    auto entries = file->entries_per_node->find(bid);
+    if(entries == file->entries_per_node->end()) {
+        file->entries_per_node->insert({bid, node->nentry});
+    }
+    mutex_unlock(&file->entries_lock);
+
+    delete latest_log;
+}
+
+fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf, uint64_t *len,
+                        err_log_callback *log_callback, bool read_on_cache_miss)
 {
     size_t lock_no;
     ssize_t r;
-    uint64_t pos = bid * file->blocksize;
+    uint64_t pos;
     fdb_status status = FDB_RESULT_SUCCESS;
-    uint64_t curr_pos = atomic_get_uint64_t(&file->pos);
+    bool index_block = false;
+    uint32_t nentry;
+    int write_len;
 
-    if (pos >= curr_pos) {
-        const char *msg = "Read error: read offset %" _F64 " exceeds the file's "
-                          "current offset %" _F64 " in a database file '%s'\n";
-        fdb_log(log_callback, FDB_LOG_ERROR, FDB_RESULT_READ_FAIL,
-                msg, pos, curr_pos, file->filename);
-        return FDB_RESULT_READ_FAIL;
+    pos = bid;
+
+    if(len && (*len == file->index_blocksize)) {
+        index_block = true;
+        *len = 0;
     }
 
-    if (global_config.ncacheblock > 0) {
+    if(global_config.kv_cache_size > 0 && !index_block) {
+        uint64_t start = 0, end = 0;
+        start = get_monotonic_ts_us();
+        r = kvcache_read(file, bid, buf);
+
+        if(r == 0) {
+            // if normal file, just read a block
+            int ret;
+            ret = retrieve(file, bid, buf, NULL);
+
+            if(ret <= 0) {
+                fflush(stdout);
+                _log_errno_str(file->ops, log_callback,
+                        (fdb_status) r, "READ", file->filename);
+                const char *msg = "Read error: BID %" _F64 " in a database file '%s' "
+                    "is not read correctly: only %d bytes read.\n";
+                status = r < 0 ? (fdb_status)r : FDB_RESULT_READ_FAIL;
+                fdb_log(log_callback, FDB_LOG_ERROR, status,
+                        msg, bid, file->filename, r);
+                if (!log_callback || !log_callback->callback) {
+                    //dbg_print_buf(buf, file->blocksize, true, 16);
+                }
+                return status;
+            }
+
+            if(len) {
+                *len = ret;
+            }
+
+            r = kvcache_write(file, bid, buf, ret, KVCACHE_REQ_CLEAN);
+            if (r != ret) {
+                _log_errno_str(file->ops, log_callback,
+                               (fdb_status) r, "WRITE", file->filename);
+                const char *msg = "Read error: BID %" _F64 " in a database file '%s' "
+                    "is not written in cache correctly: only %d bytes written.\n";
+                status = r < 0 ? (fdb_status) r : FDB_RESULT_WRITE_FAIL;
+                fdb_log(log_callback, FDB_LOG_ERROR, status,
+                        msg, bid, file->filename, r);
+                if (!log_callback || !log_callback->callback) {
+                    dbg_print_buf(buf, file->blocksize, true, 16);
+                }
+                return status;
+            }
+        } else {
+            if(len) {
+                *len = r;
+            }
+        }
+        end = get_monotonic_ts_us();
+        if(check_lat) {
+            printf("\nTID %lu *** READ LAT WAS %lu\n", pthread_self(), end - start);
+            check_lat = 0;
+        }
+    } else if (global_config.ncacheblock > 0 && index_block) {
         lock_no = bid % DLOCK_MAX;
         (void)lock_no;
 
@@ -1987,61 +3901,20 @@ fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
                 if (locked) {
                     plock_unlock(&file->plock, plock_entry);
                 }
-                const char *msg = "Read error: BID %" _F64 " in a database file '%s' "
-                    "doesn't exist in the cache and read_on_cache_miss flag is turned on.\n";
-                fdb_log(log_callback, FDB_LOG_ERROR, FDB_RESULT_READ_FAIL,
-                        msg, bid, file->filename);
                 return FDB_RESULT_READ_FAIL;
             }
 
-            // if normal file, just read a block
-            r = filemgr_read_block(file, buf, bid);
-            if (r != (ssize_t)file->blocksize) {
-                _log_errno_str(file->ops, log_callback,
-                               (fdb_status) r, "READ", file->filename);
-                if (locked) {
-                    plock_unlock(&file->plock, plock_entry);
-                }
-                const char *msg = "Read error: BID %" _F64 " in a database file '%s' "
-                    "is not read correctly: only %d bytes read.\n";
-                status = r < 0 ? (fdb_status)r : FDB_RESULT_READ_FAIL;
-                fdb_log(log_callback, FDB_LOG_ERROR, status,
-                        msg, bid, file->filename, r);
-                if (!log_callback || !log_callback->callback) {
-                    dbg_print_buf(buf, file->blocksize, true, 16);
-                }
-                return status;
+            (void)lock_no;
+            filemgr_collect_node(file, bid, buf);
+            if (len) {
+                *len = r;
             }
+            write_len = _get_bnode_write_len(buf, &nentry, true);
+            memset((uint8_t *)buf + file->index_blocksize - 1,
+                    BLK_MARKER_BNODE, BLK_MARKER_SIZE);
 
-            status = _filemgr_crc32_check(file, buf);
-            if (status != FDB_RESULT_SUCCESS) {
-                _log_errno_str(file->ops, log_callback, status, "READ",
-                        file->filename);
-                if (locked) {
-                    plock_unlock(&file->plock, plock_entry);
-                }
-                const char *msg = "Read error: checksum error on BID %" _F64 " in a database file '%s' "
-                    ": marker %x\n";
-                fdb_log(log_callback, FDB_LOG_ERROR, status,
-                        msg, bid,
-                        file->filename, *((uint8_t*)buf + file->blocksize-1));
-                if (!log_callback || !log_callback->callback) {
-                    dbg_print_buf(buf, file->blocksize, true, 16);
-                }
-                return status;
-            }
-
-            uint8_t marker = *((uint8_t*)buf + file->blocksize - 1);
-            if ( global_config.do_not_cache_doc_blocks &&
-                 marker != BLK_MARKER_BNODE ) {
-                // If caching option is ON, and not a B-tree block,
-                // we do not put it into cache.
-                r = global_config.blocksize;
-            } else {
-                r = bcache_write(file, bid, buf, BCACHE_REQ_CLEAN, false);
-            }
-
-            if (r != global_config.blocksize) {
+            r = bcache_write(file, bid, buf, BCACHE_REQ_CLEAN, false);
+            if (r != global_config.index_blocksize) {
                 if (locked) {
                     plock_unlock(&file->plock, plock_entry);
                 }
@@ -2057,9 +3930,36 @@ fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
                 }
                 return status;
             }
+        } else {
         }
+
         if (locked) {
             plock_unlock(&file->plock, plock_entry);
+        }
+    } else if (file->config->kvssd) {
+        if(!index_block) {
+            int ret = retrieve(file, bid, buf, NULL);
+            if(ret <= 0) {
+                assert(0);
+                _log_errno_str(file->ops, log_callback,
+                        (fdb_status) r, "READ", file->filename);
+                const char *msg = "Read error: BID %" _F64 " in a database file '%s' "
+                    "is not read correctly: only %d bytes read.\n";
+                status = r < 0 ? (fdb_status)r : FDB_RESULT_READ_FAIL;
+                fdb_log(log_callback, FDB_LOG_ERROR, status,
+                        msg, bid, file->filename, r);
+                if (!log_callback || !log_callback->callback) {
+                    dbg_print_buf(buf, file->blocksize, true, 16);
+                }
+                return status;
+            }
+
+            *len = ret;
+        } else {
+            filemgr_collect_node(file, bid, buf);
+            write_len = _get_bnode_write_len(buf, &nentry, true);
+            memset((uint8_t *)buf + file->index_blocksize - 1,
+                    BLK_MARKER_BNODE, BLK_MARKER_SIZE);
         }
     } else {
         if (!read_on_cache_miss) {
@@ -2070,7 +3970,7 @@ fdb_status filemgr_read(struct filemgr *file, bid_t bid, void *buf,
             return FDB_RESULT_READ_FAIL;
         }
 
-        r = filemgr_read_block(file, buf, bid);
+        r = filemgr_read_block(file, NULL, buf, bid);
         if (r != (ssize_t)file->blocksize) {
             _log_errno_str(file->ops, log_callback, (fdb_status) r, "READ",
                            file->filename);
@@ -2109,12 +4009,16 @@ fdb_status filemgr_write_offset(struct filemgr *file, bid_t bid,
                                 bool final_write,
                                 err_log_callback *log_callback)
 {
-    size_t lock_no;
     ssize_t r = 0;
-    uint64_t pos = bid * file->blocksize + offset;
-    uint64_t curr_commit_pos = atomic_get_uint64_t(&file->last_commit);
+    uint64_t pos;
+    struct docio_length docio_len;
+    uint8_t marker = 0x0;
 
-    if (offset + len > file->blocksize) {
+    pos = bid;
+
+    if (len != UINT64_MAX && 
+       ((!file->config->kvssd &&offset + len > file->blocksize) || 
+       (file->config->kvssd && offset + len > file->config->kvssd_max_value_size))) {
         const char *msg = "Write error: trying to write the buffer data "
             "(offset: %" _F64 ", len: %" _F64 " that exceeds the block size "
             "%" _F64 " in a database file '%s'\n";
@@ -2124,129 +4028,73 @@ fdb_status filemgr_write_offset(struct filemgr *file, bid_t bid,
         return FDB_RESULT_WRITE_FAIL;
     }
 
-    if (sb_bmp_exists(file->sb)) {
-        // block reusing is enabled
-        if (!sb_ops.is_writable(file, bid)) {
-            const char *msg = "Write error: trying to write at the offset %" _F64 " that is "
-                              "not identified as a reusable block in "
-                              "a database file '%s'\n";
-            fdb_log(NULL, FDB_LOG_FATAL, FDB_RESULT_WRITE_FAIL,
-                    msg, pos, file->filename);
-            return FDB_RESULT_WRITE_FAIL;
+    if(len != UINT64_MAX &&
+       global_config.kv_cache_size > 0 &&
+       global_config.kv_cache_doc_writes) {
+        r = kvcache_write(file, bid, buf, len, KVCACHE_REQ_CLEAN);
+        if (r != (ssize_t) len) {
+            assert(0);
+            _log_errno_str(file->ops, log_callback,
+                    (fdb_status) r, "WRITE", file->filename);
+            return r < 0 ? (fdb_status) r : FDB_RESULT_WRITE_FAIL;
         }
-    } else if (pos < curr_commit_pos) {
-        // stale blocks are not reused yet
-        if (file->sb == NULL ||
-            (file->sb && pos >= file->sb->config->num_sb * file->blocksize)) {
-            // (non-sequential update is exceptionally allowed for superblocks)
-            const char *msg = "Write error: trying to write at the offset %" _F64 " that is "
-                              "smaller than the current commit offset %" _F64 " in "
-                              "a database file '%s'\n";
-            fdb_log(NULL, FDB_LOG_FATAL, FDB_RESULT_WRITE_FAIL,
-                    msg, pos, curr_commit_pos, file->filename);
-            return FDB_RESULT_WRITE_FAIL;
-        }
-    }
 
-    if (global_config.ncacheblock > 0) {
-        lock_no = bid % DLOCK_MAX;
-        (void)lock_no;
-
-        bool locked = false;
-        plock_entry_t *plock_entry;
-        bid_t is_writer = 1;
-        plock_entry = plock_lock(&file->plock, &bid, &is_writer);
-        locked = true;
-
-        if (len == file->blocksize) {
-            // write entire block .. we don't need to read previous block
-            r = bcache_write(file, bid, buf, BCACHE_REQ_DIRTY, final_write);
-            if (r != global_config.blocksize) {
-                if (locked) {
-                    plock_unlock(&file->plock, plock_entry);
-                }
+        store(file, bid, buf, len, NULL);
+        atomic_add_uint64_t(&file->data_in_kvssd, VALUE_RETRIEVE_LENGTH - 1024 + sizeof(uint64_t));
+        atomic_add_uint64_t(&file->written_to_kvssd, len);
+    } else if (global_config.ncacheblock > 0 && len == UINT64_MAX) {
+            r = bcache_write(file, bid, buf, BCACHE_REQ_CLEAN, final_write);
+            if (r != global_config.index_blocksize) {
                 _log_errno_str(file->ops, log_callback,
                                (fdb_status) r, "WRITE", file->filename);
                 return r < 0 ? (fdb_status) r : FDB_RESULT_WRITE_FAIL;
             }
-        } else {
-            // partially write buffer cache first
-            r = bcache_write_partial(file, bid, buf, offset, len, final_write);
-            if (r == 0) {
-                // cache miss
-                // write partially .. we have to read previous contents of the block
-                int64_t cur_file_pos = file->ops->goto_eof(file->fd);
-                if (cur_file_pos < 0) {
-                    _log_errno_str(file->ops, log_callback,
-                                   (fdb_status) cur_file_pos, "EOF", file->filename);
-                    return (fdb_status) cur_file_pos;
-                }
-                bid_t cur_file_last_bid = cur_file_pos / file->blocksize;
-                void *_buf = _filemgr_get_temp_buf();
+    } else { // block cache disabled or not caching document blocks        
+        if (file->config->kvssd) {
+            ssize_t ret;
+            if (len == UINT64_MAX) {
+                len = 4096;
 
-                if (bid >= cur_file_last_bid) {
-                    // this is the first time to write this block
-                    // we don't need to read previous block from file.
-                } else {
-                    r = filemgr_read_block(file, _buf, bid);
-                    if (r != (ssize_t)file->blocksize) {
-                        if (locked) {
-                            plock_unlock(&file->plock, plock_entry);
-                        }
-                        _filemgr_release_temp_buf(_buf);
-                        _log_errno_str(file->ops, log_callback, (fdb_status) r,
-                                       "READ", file->filename);
-                        return r < 0 ? (fdb_status) r : FDB_RESULT_READ_FAIL;
-                    }
-                }
-                memcpy((uint8_t *)_buf + offset, buf, len);
-                r = bcache_write(file, bid, _buf, BCACHE_REQ_DIRTY, final_write);
-                if (r != global_config.blocksize) {
-                    if (locked) {
-                        plock_unlock(&file->plock, plock_entry);
-                    }
-                    _filemgr_release_temp_buf(_buf);
-                    _log_errno_str(file->ops, log_callback,
-                            (fdb_status) r, "WRITE", file->filename);
-                    return r < 0 ? (fdb_status) r : FDB_RESULT_WRITE_FAIL;
-                }
+                /*
+                 * There's no need to do anything here. The logs will be 
+                 * written in the next flush, and we aren't caching.
+                 * This is poor and should be changed later when we re-do CRC
+                 * upon node collection, as it won't work when value sizes 
+                 * are 4096 (or whatever the block size is).
+                 */
 
-                _filemgr_release_temp_buf(_buf);
-            } // cache miss
-        } // full block or partial block
-
-        if (locked) {
-            plock_unlock(&file->plock, plock_entry);
-        }
-    } else { // block cache disabled
-
-        if (len == file->blocksize) {
-            uint8_t marker = *((uint8_t*)buf + file->blocksize - 1);
-            if (marker == BLK_MARKER_BNODE) {
-                memset((uint8_t *)buf + BTREE_CRC_OFFSET, 0xff, BTREE_CRC_FIELD_LEN);
-                uint32_t crc32 = get_checksum(reinterpret_cast<const uint8_t*>(buf),
-                                              file->blocksize,
-                                              file->crc_mode);
-                crc32 = _endian_encode(crc32);
-                memcpy((uint8_t *)buf + BTREE_CRC_OFFSET, &crc32, sizeof(crc32));
+                ret = len;
+            } else {
+                store(file, bid, buf, len, NULL);
+                atomic_add_uint64_t(&file->data_in_kvssd, 
+                                    VALUE_RETRIEVE_LENGTH - 1024 + sizeof(uint64_t));
+                atomic_add_uint64_t(&file->written_to_kvssd, len);
+                ret = len;
             }
-        }
 
-        r = file->ops->pwrite(file->fd, buf, len, pos);
-        _log_errno_str(file->ops, log_callback, (fdb_status) r, "WRITE", file->filename);
-        if ((uint64_t)r != len) {
-            return r < 0 ? (fdb_status) r : FDB_RESULT_WRITE_FAIL;
+            _log_errno_str(file->ops, log_callback, (fdb_status) ret, "WRITE", file->filename);
+            if ((uint64_t) ret == len || marker == BLK_MARKER_BNODE) {
+                return FDB_RESULT_SUCCESS;
+            } else {
+                return FDB_RESULT_WRITE_FAIL;
+            }
+        } else {
+            r = file->ops->pwrite(file->fd, buf, len, pos);
+            _log_errno_str(file->ops, log_callback, (fdb_status) r, "WRITE", file->filename);
+            if ((uint64_t)r != len) {
+                return r < 0 ? (fdb_status) r : FDB_RESULT_WRITE_FAIL;
+            }
         }
     } // block cache check
     return FDB_RESULT_SUCCESS;
 }
 
-fdb_status filemgr_write(struct filemgr *file, bid_t bid, void *buf,
+fdb_status filemgr_write(struct filemgr *file, void *key, bid_t bid, void *buf,
                    err_log_callback *log_callback)
 {
     return filemgr_write_offset(file, bid, 0, file->blocksize, buf,
-                                false, // TODO: track immutability of index blk
-                                log_callback);
+                                    false, // TODO: track immutability of index blk
+                                    log_callback);
 }
 
 fdb_status filemgr_commit(struct filemgr *file, bool sync,
@@ -2270,21 +4118,12 @@ fdb_status filemgr_commit_bid(struct filemgr *file, bid_t bid,
     bid_t prev_bid, _prev_bid;
     uint64_t _deltasize, _bmp_revnum;
     fdb_seqnum_t _seqnum;
+    uint64_t _vernum;
     filemgr_header_revnum_t _revnum;
     int result = FDB_RESULT_SUCCESS;
     bool block_reusing = false;
 
     filemgr_set_io_inprog(file);
-    if (global_config.ncacheblock > 0) {
-        result = bcache_flush(file);
-        if (result != FDB_RESULT_SUCCESS) {
-            _log_errno_str(file->ops, log_callback, (fdb_status) result,
-                           "FLUSH", file->filename);
-            filemgr_clear_io_inprog(file);
-            return (fdb_status)result;
-        }
-    }
-
     spin_lock(&file->lock);
 
     uint16_t header_len = file->header.size;
@@ -2292,12 +4131,13 @@ fdb_status filemgr_commit_bid(struct filemgr *file, bid_t bid,
     filemgr_magic_t magic = file->version;
 
     if (file->header.size > 0 && file->header.data) {
-        void *buf = _filemgr_get_temp_buf();
+        void *buf = get_buf();
         uint8_t marker[BLK_MARKER_SIZE];
 
         // [header data]:        'header_len' bytes   <---+
         // [header revnum]:      8 bytes                  |
         // [default KVS seqnum]: 8 bytes                  |
+        // [current vernum]:     8 bytes                  |
         // ...                                            |
         // (empty)                                    blocksize
         // ...                                            |
@@ -2318,6 +4158,10 @@ fdb_status filemgr_commit_bid(struct filemgr *file, bid_t bid,
         _seqnum = _endian_encode(file->header.seqnum.load());
         memcpy((uint8_t *)buf + header_len + sizeof(filemgr_header_revnum_t),
                &_seqnum, sizeof(fdb_seqnum_t));
+        // file's current vernum
+        _vernum = _endian_encode(file->header.vernum.load());
+        memcpy((uint8_t *)buf + header_len + sizeof(filemgr_header_revnum_t) + sizeof(fdb_seqnum_t),
+                &_vernum, sizeof(uint64_t));
 
         // current header's sb bmp revision number
         if (file->sb) {
@@ -2370,7 +4214,11 @@ fdb_status filemgr_commit_bid(struct filemgr *file, bid_t bid,
 
         if (bid == BLK_NOT_FOUND) {
             // append header at the end of file
-            bid = atomic_get_uint64_t(&file->pos) / file->blocksize;
+            if(file->config->kvssd) {
+                bid = atomic_get_uint64_t(&file->pos); // TODO wrong
+            } else {
+                bid = atomic_get_uint64_t(&file->pos) / file->blocksize;
+            }
             block_reusing = false;
         } else {
             // write header in the allocated (reused) block
@@ -2378,14 +4226,56 @@ fdb_status filemgr_commit_bid(struct filemgr *file, bid_t bid,
             // we MUST invalidate the header block 'bid', since previous
             // contents of 'bid' may remain in block cache and cause data
             // inconsistency if reading header block hits the cache.
-            bcache_invalidate_block(file, bid);
+            if (! file->config->kvssd) {
+                bcache_invalidate_block(file, bid);
+            }
         }
 
-        ssize_t rv = filemgr_write_blocks(file, buf, 1, bid);
+        ssize_t rv;
+        if(global_config.kvssd) {
+            rv = filemgr_write_blocks_kvssd(file, NULL, buf, 1, bid);
+
+            std::string k;
+            k.append("WRITES!@#$");
+            k.append(std::to_string(file->header.revnum - 1));
+
+            void *writes = malloc(sizeof(uint64_t));
+            memcpy(writes, &file->writes_this_commit, sizeof(uint64_t));
+
+            fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                    "Persisting a write marker of %u writes during commit.", 
+                    file->writes_this_commit);
+
+            store(file, k, writes, sizeof(writes), NULL);
+
+            free(writes);
+            atomic_add_uint64_t(&file->data_in_kvssd, 
+                                k.length() + sizeof(writes));
+            atomic_add_uint64_t(&file->written_to_kvssd, 
+                                k.length() + sizeof(writes));
+
+            /* Store milestone */
+
+            store(file, MILESTONE_K, &bid, sizeof(bid), NULL);
+            atomic_add_uint64_t(&file->data_in_kvssd, 
+                                MILESTONE_K.length() + sizeof(bid));
+            atomic_add_uint64_t(&file->written_to_kvssd, 
+                                MILESTONE_K.length() + sizeof(bid));
+
+            if(sync) {
+                file->ops_kvssd->flush();
+            }
+        } else {
+            rv = filemgr_write_blocks(file, buf, 1, bid);
+        }
+
+
+        file->writes_this_commit = 0;
+
         _log_errno_str(file->ops, log_callback, (fdb_status) rv,
                        "WRITE", file->filename);
         if (rv != (ssize_t)file->blocksize) {
-            _filemgr_release_temp_buf(buf);
+            put_buf(buf);
             spin_unlock(&file->lock);
             filemgr_clear_io_inprog(file);
             return rv < 0 ? (fdb_status) rv : FDB_RESULT_WRITE_FAIL;
@@ -2393,43 +4283,24 @@ fdb_status filemgr_commit_bid(struct filemgr *file, bid_t bid,
 
         if (prev_bid) {
             // mark prev DB header as stale
-            filemgr_add_stale_block(file, prev_bid * file->blocksize, file->blocksize);
+            filemgr_add_stale_block_kvssd(file, prev_bid, file->blocksize);
         }
 
         atomic_store_uint64_t(&file->header.bid, bid);
         if (!block_reusing) {
-            atomic_add_uint64_t(&file->pos, file->blocksize);
+            if(file->config->kvssd) {
+                atomic_add_uint64_t(&file->pos, 1);
+            } else {
+                atomic_add_uint64_t(&file->pos, file->blocksize);
+            }
         }
 
-        _filemgr_release_temp_buf(buf);
+        put_buf(buf);
     }
 
-    if (sb_bmp_exists(file->sb) &&
-        atomic_get_uint64_t(&file->sb->cur_alloc_bid) != BLK_NOT_FOUND &&
-        atomic_get_uint8_t(&file->status) == FILE_NORMAL) {
-        // block reusing is currently enabled
-        atomic_store_uint64_t(&file->last_commit,
-            atomic_get_uint64_t(&file->sb->cur_alloc_bid) * file->blocksize);
-        // Since some more blocks may be allocated after the header block
-        // (for storing BMP data or system docs for stale info)
-        // so that the block pointed to by 'cur_alloc_bid' may have
-        // different BMP revision number. So we have to use the
-        // up-to-date bmp_revnum here.
-        atomic_store_uint64_t(&file->last_writable_bmp_revnum,
-                              filemgr_get_sb_bmp_revnum(file));
-    } else {
-        atomic_store_uint64_t(&file->last_commit, atomic_get_uint64_t(&file->pos));
-        // WARNING: if `last_commit` is at the end of file,
-        //          we should NOT update `last_writable_bmp_revnum`.
-    }
+    atomic_store_uint64_t(&file->last_commit, atomic_get_uint64_t(&file->pos));
 
     spin_unlock(&file->lock);
-
-    if (sync) {
-        result = file->ops->fsync(file->fd);
-        _log_errno_str(file->ops, log_callback, (fdb_status)result,
-                       "FSYNC", file->filename);
-    }
     filemgr_clear_io_inprog(file);
     return (fdb_status) result;
 }
@@ -2460,6 +4331,7 @@ fdb_status filemgr_copy_file_range(struct filemgr *src_file,
                                    bid_t src_bid, bid_t dst_bid,
                                    bid_t clone_len)
 {
+    assert(0);
     uint32_t blocksize = src_file->blocksize;
     fdb_status fs = (fdb_status)dst_file->ops->copy_file_range(
                                             src_file->fs_type,
@@ -2784,8 +4656,10 @@ fdb_status filemgr_destroy_file(char *filename,
         memset(file, 0x0, sizeof(struct filemgr));
         file->filename = filename;
         file->ops = get_filemgr_ops();
+        file->ops_kvssd = get_filemgr_ops_kvssd();
         file->fd = file->ops->open(file->filename, O_RDWR, 0666);
         file->blocksize = global_config.blocksize;
+        file->index_blocksize = global_config.index_blocksize;
         file->config = (struct filemgr_config *)alca(struct filemgr_config, 1);
         *file->config = *config;
         fdb_init_encryptor(&file->encryption, &config->encryption_key);
@@ -2797,7 +4671,12 @@ fdb_status filemgr_destroy_file(char *filename,
                 return (fdb_status) file->fd;
             }
         } else { // file successfully opened, seek to end to get DB header
-            cs_off_t offset = file->ops->goto_eof(file->fd);
+            cs_off_t offset;
+            if(file->config->kvssd) {
+                retrieve(file, MILESTONE_K, &offset, NULL);
+            } else {
+                offset = file->ops->goto_eof(file->fd);
+            }
             if (offset < 0) {
                 if (!destroy_file_set) { // top level or non-recursive call
                     hash_free(destroy_set);
@@ -2854,7 +4733,11 @@ fdb_status filemgr_destroy_file(char *filename,
                     }
                     free(file->header.data);
                 }
-                file->ops->close(file->fd);
+                if(file->config->kvssd) {
+                    file->ops_kvssd->close();
+                } else {
+                    file->ops->close(file->fd);
+                }
                 if (sb_ops.release && file->sb) {
                     sb_ops.release(file);
                 }
@@ -3085,6 +4968,13 @@ void filemgr_clear_mergetree(struct filemgr *file)
     }
 }
 
+void filemgr_add_stale_block_kvssd(struct filemgr *file, bid_t pos, size_t length)
+{
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "Putting %lu in the stale list", pos);
+    file->pairs_to_remove->enqueue(pos);
+}
+
 void filemgr_add_stale_block(struct filemgr *file,
                              bid_t pos,
                              size_t len)
@@ -3094,7 +4984,7 @@ void filemgr_add_stale_block(struct filemgr *file,
         struct list_elem *e;
 
         e = list_end(file->stale_list);
-
+        
         if (e) {
             item = _get_entry(e, struct stale_data, le);
             if (item->pos + item->len == pos) {
@@ -3187,7 +5077,7 @@ struct stale_regions filemgr_actual_stale_regions(struct filemgr *file,
 
             if (remaining) {
                 // get next BID
-                filemgr_read(file, cur_bid, (void *)buf, NULL, true);
+                filemgr_read(file, cur_bid, (void *)buf, NULL, NULL, true);
                 memcpy(&blk_meta, buf + blocksize, sizeof(blk_meta));
                 cur_bid = _endian_decode(blk_meta.next_bid);
                 cur_pos = 0; // beginning of the block
@@ -3206,22 +5096,25 @@ struct stale_regions filemgr_actual_stale_regions(struct filemgr *file,
 }
 
 void filemgr_mark_stale(struct filemgr *file,
-                        bid_t offset,
-                        size_t length)
+                        bid_t offset, size_t length)
 {
-    if (file->stale_list && length) {
-        size_t i;
-        struct stale_regions sr;
+    if(file->config->kvssd) {
+        filemgr_add_stale_block_kvssd(file, offset, length);
+    } else {
+        if (file->stale_list && length) {
+            size_t i;
+            struct stale_regions sr;
 
-        sr = filemgr_actual_stale_regions(file, offset, length);
+            sr = filemgr_actual_stale_regions(file, offset, length);
 
-        if (sr.n_regions > 1) {
-            for (i=0; i<sr.n_regions; ++i){
-                filemgr_add_stale_block(file, sr.regions[i].pos, sr.regions[i].len);
+            if (sr.n_regions > 1) {
+                for (i=0; i<sr.n_regions; ++i){
+                    filemgr_add_stale_block(file, sr.regions[i].pos, sr.regions[i].len);
+                }
+                free(sr.regions);
+            } else if (sr.n_regions == 1) {
+                filemgr_add_stale_block(file, sr.region.pos, sr.region.len);
             }
-            free(sr.regions);
-        } else if (sr.n_regions == 1) {
-            filemgr_add_stale_block(file, sr.region.pos, sr.region.len);
         }
     }
 }
@@ -3413,8 +5306,8 @@ INLINE void filemgr_dirty_update_flush(struct filemgr *file,
     while (a) {
         block = _get_entry(a, struct filemgr_dirty_update_block, avl);
         a = avl_next(a);
-        if (filemgr_is_writable(file, block->bid) && !block->immutable) {
-            filemgr_write(file, block->bid, block->addr, log_callback);
+        if (1 || filemgr_is_writable(file, block->bid) && !block->immutable) {
+            filemgr_write_offset(file, block->bid, 0, UINT64_MAX, block->addr, false, log_callback);
         }
     }
     node->expired = true;
@@ -3530,11 +5423,11 @@ void filemgr_dirty_update_set_immutable(struct filemgr *file,
                     block_copy = (struct filemgr_dirty_update_block *)
                                  calloc(1, sizeof(struct filemgr_dirty_update_block));
                     void *addr;
-                    malloc_align(addr, FDB_SECTOR_SIZE, file->blocksize);
+                    malloc_align(addr, FDB_SECTOR_SIZE, file->index_blocksize);
                     block_copy->addr = addr;
                     block_copy->bid = block->bid;
                     block_copy->immutable = block->immutable;
-                    memcpy(block_copy->addr, block->addr, file->blocksize);
+                    memcpy(block_copy->addr, block->addr, file->index_blocksize);
                 }
                 avl_insert(&node->dirty_blocks, &block_copy->avl, _dirty_blocks_cmp);
             }
@@ -3636,14 +5529,14 @@ fdb_status filemgr_write_dirty(struct filemgr *file, bid_t bid, void *buf,
         block = (struct filemgr_dirty_update_block *)
                 calloc(1, sizeof(struct filemgr_dirty_update_block));
         void *addr = NULL;
-        malloc_align(addr, FDB_SECTOR_SIZE, file->blocksize);
+        malloc_align(addr, FDB_SECTOR_SIZE, file->index_blocksize);
         block->addr = addr;
         block->bid = bid;
         block->immutable = false;
         avl_insert(&node->dirty_blocks, &block->avl, _dirty_blocks_cmp);
     }
 
-    memcpy(block->addr, buf, file->blocksize);
+    memcpy(block->addr, buf, file->index_blocksize);
     return FDB_RESULT_SUCCESS;
 }
 
@@ -3663,7 +5556,7 @@ fdb_status filemgr_read_dirty(struct filemgr *file, bid_t bid, void *buf,
         if (a) {
             // exist .. directly read the dirty block
             block = _get_entry(a, struct filemgr_dirty_update_block, avl);
-            memcpy(buf, block->addr, file->blocksize);
+            memcpy(buf, block->addr, file->index_blocksize);
             return FDB_RESULT_SUCCESS;
         }
         // not exist .. search the latest immutable dirty update next
@@ -3675,13 +5568,14 @@ fdb_status filemgr_read_dirty(struct filemgr *file, bid_t bid, void *buf,
         if (a) {
             // exist .. directly read the dirty block
             block = _get_entry(a, struct filemgr_dirty_update_block, avl);
-            memcpy(buf, block->addr, file->blocksize);
+            memcpy(buf, block->addr, file->index_blocksize);
             return FDB_RESULT_SUCCESS;
         }
     }
-
+    
+    uint64_t len = file->blocksize;
     // not exist in both dirty update entries .. call filemgr_read()
-    return filemgr_read(file, bid, buf, log_callback, read_on_cache_miss);
+    return filemgr_read(file, bid, buf, &len, log_callback, read_on_cache_miss);
 }
 
 void _kvs_stat_set(struct filemgr *file,

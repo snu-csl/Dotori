@@ -69,7 +69,7 @@ static void _dbg_hang_process(void)
 
 // to profile first install perf
 // echo 0 > /proc/sys/kernel/kptr_restrict
-#if defined(__linux__) && !defined(__ANDROID__)
+#if 0 && defined(__linux__) && !defined(__ANDROID__) 
 #include <string.h>
 #include <dlfcn.h>
 #include <ucontext.h>

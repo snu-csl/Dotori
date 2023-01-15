@@ -28,8 +28,9 @@ extern "C" {
 
 #define HBTRIE_MAX_KEYLEN (FDB_MAX_KEYLEN_INTERNAL+16)
 #define HBTRIE_HEADROOM (256)
-
+  
 typedef size_t hbtrie_func_readkey(void *handle, uint64_t offset, void *buf);
+typedef size_t hbtrie_func_readkey_async(void *handle, uint64_t offset, void *buf, void* cb);
 typedef int hbtrie_cmp_func(void *key1, void *key2, void* aux);
 // a function pointer to a routine that returns a function pointer
 typedef void hbtrie_cmp_map(void* chunk,
@@ -57,6 +58,29 @@ typedef enum {
     HBTRIE_RESULT_FAIL
 } hbtrie_result;
 
+typedef enum {
+  WAL_PRELOAD,
+  FDB_GET
+} hbtrie_async_find_type;
+
+struct hbtrie_find_ctx_t
+{
+    fdb_kvs_handle *handle;
+    fdb_doc *udoc;
+    // struct filemgr *file;
+    // struct docio_handle *dhandle;
+    // struct docio_object *doc;
+    // err_log_callback *log_callback;
+    // size_t keylen;
+    uint64_t offset;
+    hbtrie_result hr;
+    // struct docio_length *length;
+    hbtrie_find_cb_fn hbtrie_find_cb;
+    user_fdb_async_get_cb_fn user_cb;
+    // void *buf;
+    // int rderrno;
+};
+
 #define HBTRIE_FLAG_COMPACT (0x01)
 struct btree_blk_ops;
 struct btree_kv_ops;
@@ -75,6 +99,7 @@ struct hbtrie {
     struct btree_kv_ops *btree_kv_ops;
     struct btree_kv_ops *btree_leaf_kv_ops;
     hbtrie_func_readkey *readkey;
+    hbtrie_func_readkey *readkeyasync;
     hbtrie_cmp_map *map;
     btree_cmp_args cmp_args;
     void *last_map_chunk;
@@ -155,7 +180,9 @@ hbtrie_result hbtrie_next_partial(struct hbtrie_iterator *it,
                                   void *value_buf);
 hbtrie_result hbtrie_next_value_only(struct hbtrie_iterator *it,
                                  void *value_buf);
-
+hbtrie_result hbtrie_repack(struct hbtrie *trie, void *rawkey, int rawkeylen);
+hbtrie_result hbtrie_repack_async(struct hbtrie *trie, void *rawkey, 
+                                  int rawkeylen, struct async_read_ctx_t* ctx);
 hbtrie_result hbtrie_find(struct hbtrie *trie,
                           void *rawkey,
                           int rawkeylen,
@@ -166,7 +193,9 @@ hbtrie_result hbtrie_find_offset(struct hbtrie *trie,
                                  void *valuebuf);
 hbtrie_result hbtrie_find_partial(struct hbtrie *trie, void *rawkey,
                                   int rawkeylen, void *valuebuf);
-
+hbtrie_result hbtrie_find_async(struct hbtrie *trie, void *rawkey,
+                                int rawkeylen, void *valuebuf, 
+                                async_read_ctx_t *ctx);
 hbtrie_result hbtrie_remove(struct hbtrie *trie, void *rawkey, int rawkeylen);
 hbtrie_result hbtrie_remove_partial(struct hbtrie *trie,
                                     void *rawkey,

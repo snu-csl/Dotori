@@ -32,7 +32,9 @@ extern "C" {
 
 static const long int ERR_NS = 0xFFFFFFFF;
 typedef  long int ts_nsec;
+typedef  long int ts_usec;
 ts_nsec get_monotonic_ts();
+ts_nsec get_monotonic_ts_us();
 ts_nsec ts_diff(ts_nsec start, ts_nsec end);
 ts_nsec timed_fdb_get(fdb_kvs_handle *kv, fdb_doc *doc);
 ts_nsec timed_fdb_set(fdb_kvs_handle *kv, fdb_doc *doc);

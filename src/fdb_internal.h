@@ -25,8 +25,8 @@
 #include "btreeblock.h"
 #include "hbtrie.h"
 #include "docio.h"
-#include "staleblock.h"
 #include "log_message.h"
+#include "staleblock.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,6 +85,11 @@ fdb_status fdb_compact_file(fdb_file_handle *fhandle,
                             bool in_place_compaction,
                             bid_t marker_bid,
                             bool clone_docs,
+                            const fdb_encryption_key *new_encryption_key,
+                            const fdb_compact_opt* opt);
+
+fdb_status fdb_compact_kvssd_keyspace(fdb_file_handle *fhandle,
+                            bid_t marker_bid,
                             const fdb_encryption_key *new_encryption_key,
                             const fdb_compact_opt* opt);
 
@@ -213,11 +218,21 @@ stale_header_info fdb_get_smallest_active_header(fdb_kvs_handle *handle);
 
 INLINE size_t _fdb_get_docsize(struct docio_length len)
 {
-    size_t ret =
-        len.keylen +
-        len.metalen +
-        len.bodylen_ondisk +
-        sizeof(struct docio_length);
+    size_t ret;
+    if (len.bodylen_ondisk == 0) {
+        ret =
+                len.keylen +
+                len.metalen +
+                len.bodylen +
+                sizeof(struct docio_length);
+    }
+    else {
+        ret =
+                len.keylen +
+                len.metalen +
+                len.bodylen_ondisk +
+                sizeof(struct docio_length);
+    }
 
     ret += sizeof(timestamp_t);
 

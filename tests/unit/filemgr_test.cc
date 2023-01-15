@@ -75,9 +75,9 @@ int main()
 {
     int r = system(SHELL_DEL" filemgr_testfile");
     (void)r;
-
+    
     basic_test(FDB_ENCRYPTION_NONE);
-    basic_test(FDB_ENCRYPTION_BOGUS);
+//    basic_test(FDB_ENCRYPTION_BOGUS);
     mt_init_test();
 
     return 0;

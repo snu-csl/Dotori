@@ -28,6 +28,7 @@ extern "C" {
 #endif
 
     fdb_config get_default_config(void);
+    fdb_config get_default_config_kvssd(void);
     fdb_kvs_config get_default_kvs_config(void);
 
     bool validate_fdb_config(fdb_config *fconfig);

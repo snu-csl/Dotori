@@ -115,11 +115,11 @@ fdb_status fdb_log_impl(err_log_callback* log_callback,
                            "INFO", "DEBG", "TRAC"};
     printISOTime(ISO_time_buffer, 64);
     if (status != FDB_RESULT_SUCCESS) {
-        fprintf(stderr, "%s [%s][FDB] %s\n",
-                ISO_time_buffer, log_abbr[cur_log_level], msg);
+        fprintf(stderr, "%s %lu [%s][FDB] %s\n",
+                ISO_time_buffer, pthread_self(), log_abbr[cur_log_level], msg);
     } else {
-        fprintf(stderr, "%s [%s][FDB] %s\n",
-                ISO_time_buffer, log_abbr[cur_log_level], msg);
+        fprintf(stderr, "%s %lu [%s][FDB] %s\n",
+                ISO_time_buffer, pthread_self(), log_abbr[cur_log_level], msg);
     }
     return status;
 }

@@ -21,6 +21,7 @@
 #include <time.h>
 
 #include "internal_types.h"
+#include "wal.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,9 +36,19 @@ void bgflusher_shutdown();
 fdb_status bgflusher_register_file(struct filemgr *file,
                                    fdb_config *config,
                                    err_log_callback *log_callback);
+fdb_status bgflusher_register_kv_handle(struct filemgr *file,
+										                    fdb_file_handle *fhandle,
+                                        fdb_kvs_handle *dbhandle,
+                                        const char *filename,
+                                        const char *dbname,
+                                        fdb_config *config,
+                                        fdb_kvs_config *kvs_config,
+                                        err_log_callback *log_callback,
+                                        wal_flush_func *flush_func);
 void bgflusher_switch_file(struct filemgr *old_file, struct filemgr *new_file,
                            err_log_callback *log_callback);
 void bgflusher_deregister_file(struct filemgr *file);
+void bgflusher_deregister_kv_handle(const char *dbname);
 
 #ifdef __cplusplus
 }

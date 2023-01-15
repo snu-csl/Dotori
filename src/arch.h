@@ -264,7 +264,7 @@
             (pthread_spin_trylock(arg) == 0)
         #define spin_unlock(arg) pthread_spin_unlock(arg)
         #define spin_destroy(arg) pthread_spin_destroy(arg)
-        #define SPIN_INITIALIZER (spin_t)(0)
+        #define SPIN_INITIALIZER (spin_t)(1)
     #endif
     #ifndef mutex_t
         // mutex

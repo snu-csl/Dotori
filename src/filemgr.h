@@ -1,4 +1,4 @@
-/* -*- Mode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
+/* -*- iode: C++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 /*
  *     Copyright 2010 Couchbase, Inc
  *
@@ -18,10 +18,16 @@
 #ifndef _JSAHN_FILEMGR_H
 #define _JSAHN_FILEMGR_H
 
+#include <condition_variable>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <stdint.h>
 #include <errno.h>
+#include <unordered_map>
+#include <unordered_set>
+#include <queue>
+#include <mutex>
+#include <map>
 
 #ifdef _ASYNC_IO
 #if !defined(WIN32) && !defined(_WIN32)
@@ -29,6 +35,10 @@
 #include <sys/time.h>
 #endif
 #endif
+
+#include "blockingconcurrentqueue.h"
+
+using namespace moodycamel;
 
 #include "libforestdb/fdb_errors.h"
 
@@ -40,12 +50,16 @@
 #include "atomic.h"
 #include "checksum.h"
 #include "filemgr_ops.h"
+#include "filemgr_ops_kvssd.h"
 #include "encryption.h"
 #include "superblock.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+
+extern std::map<uint64_t, uint64_t> entry_counts;
 
 #define FILEMGR_SYNC 0x01
 #define FILEMGR_READONLY 0x02
@@ -60,10 +74,12 @@ struct filemgr_config {
 
     filemgr_config& operator=(const filemgr_config& config) {
         blocksize = config.blocksize;
+        index_blocksize = config.index_blocksize;
         ncacheblock = config.ncacheblock;
         flag = config.flag;
         seqtree_opt = config.seqtree_opt;
         chunksize = config.chunksize;
+        kv_cache_size = config.kv_cache_size;
         options = config.options;
         prefetch_duration = config.prefetch_duration;
         num_wal_shards = config.num_wal_shards;
@@ -78,11 +94,37 @@ struct filemgr_config {
                                                   std::memory_order_relaxed),
                               std::memory_order_relaxed);
         do_not_cache_doc_blocks = config.do_not_cache_doc_blocks;
+        kvssd = config.kvssd;
+        logging = config.logging;
+        max_log_threshold = config.max_log_threshold;
+        kvssd_emu_config_file = config.kvssd_emu_config_file;
+        kvssd_dev_path = config.kvssd_dev_path;
+        kv_cache_size = config.kv_cache_size;
+        kv_cache_doc_writes = config.kv_cache_doc_writes;
+        kvssd_max_value_size = config.kvssd_max_value_size;
+        background_wal_preload = config.background_wal_preload;
+        wal_flush_preloading = config.wal_flush_preloading;
+        delete_during_wal_flush = config.delete_during_wal_flush;
+        bnode_ksize = bnode_vsize = 8;
+        split_threshold = config.split_threshold;
+        max_log_threshold = config.max_log_threshold;
+        cold_log_threshold = config.cold_log_threshold;
+        log_trim_mb = config.log_trim_mb;
+        cold_log_scan_interval = config.cold_log_scan_interval;
+        log_trim_threshold = config.log_trim_threshold;
+        write_index_on_close = config.write_index_on_close;
+        max_logs_per_node = config.max_logs_per_node;
+        num_aio_workers = config.num_aio_workers;
+        max_outstanding = config.max_outstanding;
+        deletion_interval = config.deletion_interval;
+        kvssd_retrieve_length = config.kvssd_retrieve_length;
+        async_wal_flushes = config.async_wal_flushes;
         return *this;
     }
 
     // TODO: Move these variables to private members as we refactor the code in C++.
     int blocksize;
+    int index_blocksize;
     int ncacheblock;
     int flag;
     int chunksize;
@@ -98,6 +140,30 @@ struct filemgr_config {
     // be kept for snapshot readers.
     atomic_uint64_t num_keeping_headers;
     bool do_not_cache_doc_blocks;
+    bool kvssd;
+    bool logging;
+    char* kvssd_emu_config_file;
+    char* kvssd_dev_path;
+    uint64_t kv_cache_size;
+    bool kv_cache_doc_writes;
+    uint32_t kvssd_max_value_size;
+    bool background_wal_preload;
+    bool wal_flush_preloading;
+    uint8_t bnode_ksize, bnode_vsize;
+    uint64_t max_log_threshold;
+    int split_threshold;
+    bool delete_during_wal_flush;
+    uint64_t cold_log_threshold;
+    uint64_t log_trim_mb;
+    uint64_t cold_log_scan_interval;
+    double log_trim_threshold;
+    bool write_index_on_close;
+    uint32_t max_logs_per_node;
+    uint32_t num_aio_workers;
+    uint32_t max_outstanding;
+    uint16_t deletion_interval;
+    uint32_t kvssd_retrieve_length;
+    bool async_wal_flushes;
 };
 
 #ifndef _LATENCY_STATS
@@ -155,6 +221,7 @@ struct filemgr_header{
     filemgr_header_len_t size;
     filemgr_header_revnum_t revnum;
     atomic_uint64_t seqnum;
+    atomic_uint64_t vernum;
     atomic_uint64_t bid;
     struct kvs_ops_stat op_stat; // op stats for default KVS
     struct kvs_stat stat; // stats for the default KVS
@@ -178,12 +245,30 @@ typedef struct {
     bool locked;
 } mutex_lock_t;
 
+//extern uint32_t VALUE_RETRIEVE_LENGTH;
+//extern uint32_t LOG_RETRIEVE_LENGTH;
+
+//extern uint32_t KVSSD_RETRIEVE_LENGTH;
+//extern uint32_t LOG_LENGTH;
+extern uint32_t MAX_OUTSTANDING_REQUESTS;
+
+struct cmp_str
+{
+    bool operator()(char const *a, char const *b) const
+    {
+        return strcmp(a, b) < 0;
+    }
+};
+
+typedef std::map<uint64_t, std::string> idx_log;
+typedef void (*io_cb)(struct nvme_passthru_kv_cmd, void*);
 struct filemgr {
     char *filename; // Current file name.
     atomic_uint32_t ref_count;
     uint8_t fflags;
     uint16_t filename_len;
     uint32_t blocksize;
+    uint32_t index_blocksize;
     int fd;
     atomic_uint64_t pos;
     atomic_uint64_t last_commit;
@@ -193,14 +278,18 @@ struct filemgr {
     struct wal *wal;
     struct filemgr_header header;
     struct filemgr_ops *ops;
+    struct filemgr_ops_kvssd *ops_kvssd;
     struct hash_elem e;
     atomic_uint8_t status;
     struct filemgr_config *config;
+
+    // KvssdMgr *kvssd;
 
     char *old_filename;                 // Old file name before compaction
     char *new_filename;                 // New file name after compaction
 
     std::atomic<struct fnamedic_item *> bcache;
+    std::atomic<struct fnamedic_item *> kvcache;
     fdb_txn global_txn;
     bool in_place_compaction;
     filemgr_fs_type_t fs_type;
@@ -234,6 +323,9 @@ struct filemgr {
     spin_t data_spinlock[DLOCK_MAX];
 #endif //__FILEMGR_DATA_PARTIAL_LOCK
 
+    std::mutex data_mutex[DLOCK_MAX];
+    fdb_rw_lock kv_data_cache_lock;
+    
     // mutex for synchronization among multiple writers.
     mutex_lock_t writer_lock;
 
@@ -268,6 +360,115 @@ struct filemgr {
      * Spin lock for file handle index.
      */
     spin_t fhandle_idx_lock;
+
+    std::unordered_set<uint64_t> *open_snapshots;
+    uint64_t snapshot_idx;
+    std::mutex open_snapshots_lock;
+
+    uint64_t max_pending_handles;
+    atomic_uint64_t btree_handle_idx;
+    struct btreeblk_handle** btreeblk_handles;
+    atomic_uint64_t busy_handles_idx;
+    atomic_uint64_t finished_handles;
+    atomic_uint64_t sent_handles;
+
+    std::mutex btreeblk_lock;
+    std::condition_variable btreeblk_cond;
+    std::vector<struct btreeblk_handle*> *free_btreeblk_handles;
+
+    /*
+     * Turn on sync writes globally
+     */
+
+    bool sync_mode;
+
+    /*
+     * Log writes yet to be persisted
+     */
+
+    std::unordered_map<uint64_t, std::string> *outstanding_logs;
+    mutex_t entries_lock;
+    mutex_t logs_per_node_lock;
+    mutex_t outstanding_log_lock;
+    std::mutex flush_lock;
+    std::condition_variable flush_cond;
+    bool ready;
+    pthread_t flush_thread;
+    atomic_uint8_t flush_shutdown;
+    atomic_uint64_t logs_occupied_space;
+
+    /*
+     * Logs to be deleted
+     */
+
+    std::unordered_set<uint64_t> *logs_map;
+    std::deque<uint64_t> *logs_to_remove;
+    std::mutex log_del_lock;
+    std::condition_variable log_del_cond;
+    bool del_ready;
+    pthread_t log_del_thread;
+    atomic_uint8_t log_del_shutdown;
+    bool log_flushing = false;
+
+    atomic_uint64_t data_in_kvssd;
+    atomic_uint64_t written_to_kvssd;
+    atomic_uint64_t requested_by_user;
+
+    /*
+     * Pairs to be deleted
+     */
+
+    BlockingConcurrentQueue<uint64_t> *pairs_to_remove;
+    pthread_t pair_del_thread;
+    atomic_uint8_t pair_del_shutdown;
+
+    /*
+     * Logs to repack this commit
+     */
+
+    std::vector<uint64_t> *to_repack;
+
+    /*
+     * Number of entries in each index node. Used to know
+     * when to split and read in the logs for the node
+     */
+
+    std::unordered_map<uint64_t, int16_t> *entries_per_node;
+
+    /*
+     * Writes this commit. Used in recovery.
+     */
+
+    uint64_t writes_this_commit;
+
+    /*
+     * A count of the amount of outstanding logs for
+     * each index node
+     */
+
+    std::map<uint64_t, uint64_t> *logs_per_node;
+
+    /*
+     * If we're still flushing logs from a previous
+     * WAL flush
+     */
+
+    atomic_uint8_t flushing;
+
+    /*
+     * Track these to understand flush performance better.
+     * A read refers to a read from storage, not cache.
+     */
+
+    uint32_t this_flush_inner_reads;
+    uint32_t this_flush_leaf_reads;
+    uint32_t this_flush_leaf_split_reads;
+    std::unordered_set<uint64_t> *this_flush_leaves_updated;
+
+    atomic_uint8_t deletes_done;
+    atomic_uint64_t user_data;
+
+    atomic_uint8_t force_discard;
 };
 
 struct filemgr_dirty_update_node {
@@ -329,6 +530,7 @@ void filemgr_set_lazy_file_deletion(bool enable,
 void filemgr_set_sb_operation(struct sb_ops ops);
 
 uint64_t filemgr_get_bcache_used_space(void);
+uint64_t filemgr_get_kvcache_used_space(void);
 
 bool filemgr_set_kv_header(struct filemgr *file, struct kvs_header *kv_header,
                            void (*free_kv_header)(struct filemgr *file));
@@ -362,6 +564,15 @@ filemgr_header_revnum_t filemgr_get_header_revnum(struct filemgr *file);
 
 fdb_seqnum_t filemgr_get_seqnum(struct filemgr *file);
 void filemgr_set_seqnum(struct filemgr *file, fdb_seqnum_t seqnum);
+fdb_seqnum_t filemgr_assign_new_seqnum(struct filemgr *file);
+
+fdb_seqnum_t filemgr_get_current_vernum(struct filemgr *file);
+void filemgr_set_vernum(struct filemgr *file, uint64_t vernum);
+fdb_seqnum_t filemgr_assign_new_vernum(struct filemgr *file);
+
+void filemgr_get_commitid_and_vernum(struct filemgr *file, uint64_t vernum, uint64_t *commitid, uint64_t *seqnum);
+void filemgr_set_bnode_log(struct filemgr *file, bid_t bid, uint32_t num);
+void filemgr_delete_bnode_log(struct filemgr *file, bid_t bid);
 
 INLINE bid_t filemgr_get_header_bid(struct filemgr *file)
 {
@@ -419,17 +630,40 @@ bool filemgr_is_fully_resident(struct filemgr *file);
 uint64_t filemgr_flush_immutable(struct filemgr *file,
                                  err_log_callback *log_callback);
 
-fdb_status filemgr_read(struct filemgr *file,
-                        bid_t bid, void *buf,
+void filemgr_delete_logs(struct filemgr *file, bool sync);
+//idx_log filemgr_get_idx_log(struct filemgr *file);
+void filemgr_trim_log(struct filemgr *file);
+void filemgr_write_log(struct filemgr *file, uint64_t bid, std::string *log, bool sync, 
+                       atomic_uint64_t *countm, bool purge);
+void filemgr_write_logs(struct filemgr *file, bool sync);
+void filemgr_compact_logs(struct filemgr *file, bool sync);
+void filemgr_clear_log(struct filemgr *file, uint64_t bid);
+void filemgr_delete_log(struct filemgr *file, uint64_t bid, 
+                        uint64_t log_num, bool sync);
+void filemgr_clear_logs(struct filemgr *file);
+
+fdb_status filemgr_read(struct filemgr *file, bid_t bid, 
+                        void *buf, uint64_t *len,
                         err_log_callback *log_callback,
                         bool read_on_cache_miss);
+ssize_t filemgr_read_block(struct filemgr *file, void *key, void *buf, bid_t bid);
 
+void flush_aio_queue(struct filemgr* file, int queue);
+uint64_t queue_aio_event(struct filemgr* file, struct aio_event event, int queue);
+void send_aio_event(struct filemgr* file, uint64_t offset, uint64_t event_idx);
+void queue_aio_event_nowait(struct filemgr* file, struct aio_event event, int queue);
+void filemgr_put_buf(struct filemgr* file, void *buf);
+void* filemgr_get_buf(struct filemgr* file);
 fdb_status filemgr_write_offset(struct filemgr *file, bid_t bid, uint64_t offset,
                           uint64_t len, void *buf, bool final_write,
                           err_log_callback *log_callback);
-fdb_status filemgr_write(struct filemgr *file, bid_t bid, void *buf,
+fdb_status filemgr_write(struct filemgr *file, void *key, bid_t bid, void *buf,
                    err_log_callback *log_callback);
 ssize_t filemgr_write_blocks(struct filemgr *file, void *buf, unsigned num_blocks, bid_t start_bid);
+// ForestKV Modification
+ssize_t filemgr_write_blocks_kvssd(struct filemgr *file, void *key, void *buf, unsigned num_blocks, bid_t start_bid);
+ssize_t filemgr_write_pair_kvssd(struct filemgr *file, void *val, size_t vlen, bid_t vernum);
+ssize_t filemgr_write_bnode_with_log(struct filemgr *file, void *val, size_t vlen, bid_t vernum);
 int filemgr_is_writable(struct filemgr *file, bid_t bid);
 
 void filemgr_remove_file(struct filemgr *file);
@@ -629,6 +863,16 @@ INLINE struct list * filemgr_get_stale_list(struct filemgr *file)
 {
     return file->stale_list;
 }
+
+/**
+ * Add an item into stale-block list of the given 'file'.
+ *
+ * @param file Pointer to file handle.
+ * @param pos Byte offset to the beginning of the stale region.
+ * @param len Length of the stale region.
+ * @return void.
+ */
+void filemgr_add_stale_block_kvssd(struct filemgr *file, bid_t pos, size_t length);
 
 /**
  * Add an item into stale-block list of the given 'file'.
@@ -874,6 +1118,15 @@ fdb_status filemgr_read_dirty(struct filemgr *file,
                               struct filemgr_dirty_update_node *node_writer,
                               err_log_callback *log_callback,
                               bool read_on_cache_miss);
+fdb_status filemgr_read_dirty_async(struct filemgr *file,
+                                    bid_t bid,
+                                    void *buf,
+                                    struct filemgr_dirty_update_node *node_reader,
+                                    struct filemgr_dirty_update_node *node_writer,
+                                    err_log_callback *log_callback,
+                                    bool read_on_cache_miss,
+                                    docio_cb_fn cb,
+                                    struct async_read_ctx_t *ctx);
 
 void _kvs_stat_set(struct filemgr *file,
                    fdb_kvs_id_t kv_id,
@@ -913,9 +1166,45 @@ fdb_status convert_errno_to_fdb_status(int errno_value,
                                        fdb_status default_status);
 
 void _print_cache_stats();
+uint64_t filemgr_get_valid_logs(struct filemgr *file, bid_t bid, uint64_t *valid_key, uint64_t *valid_value);
+void filemgr_delete_logs_while_rollback(struct filemgr *file, uint64_t last_wal_flush_hdr_bid);
+
 
 #ifdef __cplusplus
 }
 #endif
+
+key _compose_log_key(uint64_t bid, uint32_t log_num);
+
+/*
+ * Helper functions to store different types of keys.
+ * The initial idea was to create these instead of having to
+ * allocate and free a key before and after calling store, 
+ * retrieve, etc each time at many places in the code.
+ */
+
+
+fdb_status del(struct filemgr *file, std::string str, 
+               struct callback_args *cb);
+fdb_status del(struct filemgr *file, uint64_t vernum,
+               struct callback_args *cb);
+fdb_status del(struct filemgr *file, uint64_t vernum, 
+               uint32_t log_num, struct callback_args *cb);
+
+ssize_t store(struct filemgr *file, std::string str, 
+              void* buf, uint32_t vlen, struct callback_args *cb);
+ssize_t store(struct filemgr *file, uint64_t vernum,
+              void* buf, uint32_t vlen, struct callback_args *cb);
+ssize_t store(struct filemgr *file, uint64_t vernum, uint32_t log_num,
+              void* buf, uint32_t vlen, struct callback_args *cb);
+
+ssize_t retrieve(struct filemgr *file, std::string str, 
+                 void* buf, struct callback_args *cb);
+ssize_t retrieve(struct filemgr *file, uint64_t vernum,
+                 void* buf, struct callback_args *cb);
+ssize_t retrieve(struct filemgr *file, uint64_t vernum, uint32_t log_num,
+                 void* buf, struct callback_args *cb);
+
+void _remove_block(uint64_t block);
 
 #endif

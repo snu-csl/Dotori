@@ -15,29 +15,37 @@
  *   limitations under the License.
  */
 
+#include <algorithm>
+#include <future> 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <time.h>
+#include <map>
 #if !defined(WIN32) && !defined(_WIN32)
 #include <sys/time.h>
 #endif
+#include <bits/stdc++.h>
 
 #include "libforestdb/forestdb.h"
 #include "fdb_internal.h"
 #include "filemgr.h"
+#include "kv_data_cache.h"
 #include "hbtrie.h"
 #include "list.h"
 #include "breakpad.h"
 #include "btree.h"
+#include "btreeblock.h"
 #include "btree_kv.h"
 #include "btree_var_kv_ops.h"
 #include "docio.h"
 #include "btreeblock.h"
 #include "common.h"
 #include "wal.h"
+#include "filemgr.h"
 #include "filemgr_ops.h"
+#include "filemgr_ops_kvssd.h"
 #include "configuration.h"
 #include "internal_types.h"
 #include "bgflusher.h"
@@ -47,8 +55,8 @@
 #include "timing.h"
 #include "system_resource_stats.h"
 #include "version.h"
-#include "staleblock.h"
-
+#include "kvssdmgr.h"
+#include "blockcache.h"
 #ifdef __DEBUG
 #ifndef __DEBUG_FDB
     #undef DBG
@@ -59,7 +67,6 @@
     #define DBGSW(n, ...)
 #endif
 #endif
-
 
 static atomic_uint8_t fdb_initialized(0);
 static volatile uint32_t fdb_open_inprog = 0;
@@ -86,8 +93,10 @@ size_t _fdb_readkey_wrap(void *handle, uint64_t offset, void *buf)
     fdb_status fs;
     keylen_t keylen;
     struct docio_handle *dhandle = (struct docio_handle*)handle;
+    std::string k;
 
     offset = _endian_decode(offset);
+
     fs = docio_read_doc_key(dhandle, offset, &keylen, buf);
     if (fs == FDB_RESULT_SUCCESS) {
         return keylen;
@@ -561,6 +570,636 @@ INLINE void _fdb_restore_wal(fdb_kvs_handle *handle,
     }
     handle->dhandle->log_callback = log_callback;
 }
+struct recovery_item_args {
+    fdb_kvs_handle *handle;
+    struct docio_handle *dhandle;
+    std::mutex *dhandle_lock;
+    uint64_t commit_id;
+    fdb_restore_mode_t mode;
+    struct _fdb_key_cmp_info cmp_info;
+    fdb_kvs_id_t kv_id_req;
+    std::vector<std::pair<fdb_doc*, uint64_t>> *wal_items;
+    std::mutex *wal_items_lock;
+    atomic_uint8_t *num_in_flight;
+    atomic_uint32_t *remaining;
+    uint64_t offset;
+    uint32_t *restored_count;
+    atomic_uint32_t *outstanding_reads;
+    bool skipped = false;
+};
+
+#ifndef __KVSSD_EMU
+void _recovery_free(struct nvme_passthru_kv_cmd cmd, 
+                    void *voidargs) {
+    free((void*) cmd.data_addr);
+    free(voidargs);
+}
+#else
+void _recovery_free(kvs_postprocess_context *ioctx, 
+                    void *voidargs) {
+    free(ioctx->key->key);
+    free(ioctx->key);
+    free(ioctx->value->value);
+    free(ioctx->value);
+    free(ioctx->private1);
+}
+#endif
+
+void __recovery_read_cb(struct recovery_item_args *args, 
+                        int result, char *key, char* value,
+                        size_t vlen) {
+    fdb_kvs_handle *handle;
+    std::vector<std::pair<fdb_doc*, uint64_t>> *wal_items;
+    struct docio_handle *dhandle;
+    uint64_t offset;
+    fdb_restore_mode_t mode;
+    fdb_kvs_id_t kv_id_req;
+    std::mutex *wal_items_lock;
+    uint32_t *restored_count;
+
+    handle = args->handle;
+    wal_items = args->wal_items;
+    dhandle = args->dhandle;
+    offset = args->offset;
+    mode = args->mode;
+    kv_id_req = args->kv_id_req;
+    wal_items_lock = args->wal_items_lock;
+    restored_count= args->restored_count;
+
+    if(result != 0) {
+        if(strncmp(key, "@mile", 5) &&
+                strncmp(key, "@Supe", 5)) {
+            fdb_log(NULL, FDB_LOG_ERROR,
+                    FDB_RESULT_READ_FAIL,
+                    "Failed a recovery read for offset %lu. Result %u.\n",
+                    offset, result);
+            atomic_decr_uint32_t(args->outstanding_reads);
+            free(args);
+            return;
+        } else {
+            atomic_decr_uint32_t(args->outstanding_reads);
+            free(args);
+            return;
+        }
+    }
+
+    /*
+     * We skip the logic for handling transactions in the WAL
+     * for now.
+     */
+
+#ifdef __KVSSD_EMU
+    /*
+     * If we don't write the buffer to the cache here, the subsequent
+     * call to docio_buf_to_doc will attempt to call a retrieve in the
+     * emulator, which doesn't work since we are already inside
+     * a callback at this point.
+     */
+    
+    kvcache_write(handle->file, offset, value, vlen, KVCACHE_REQ_CLEAN);
+#endif
+
+    docio_object doc;
+    uint64_t doc_offset;
+    uint64_t _offset = docio_buf_to_doc(dhandle, offset, &doc, (void*)value);
+
+    if (doc.key || (doc.length.flag & DOCIO_TXN_COMMITTED)) {
+        // check if the doc is transactional or not, and
+        // also check if the doc contains system info
+        if (args->skipped || 
+                (!(doc.length.flag & DOCIO_TXN_DIRTY) &&
+                 !(doc.length.flag & DOCIO_SYSTEM))) {
+            if (doc.length.flag & DOCIO_TXN_COMMITTED) {
+                assert(0);
+                //// commit mark .. read doc offset
+                //doc_offset = doc.doc_offset;
+                //// read the previously skipped doc
+
+                ///*
+                //   Reading from the KVSSD when we're already inside
+                //   a KVSSD callback causes issues, so we send it in
+                //   another async read and return.
+                //   */
+
+                //args->offset = doc_offset;
+                //args->skipped = true;
+
+                //free((void*) data_addr);
+
+                //void* read_buffer = malloc(KVSSD_RETRIEVE_LENGTH);
+                //(void)read_buffer;
+                //assert(0);
+                ////handle->file->ops_kvssd->retrieve(doc_offset, read_buffer, (void*)kvssd_cb_args);
+                //return;
+                // if (docio_read_doc(dhandle, doc_offset, &doc, true) <= 0) {
+                //     // doc read error
+                //     free(doc.key);
+                //     free(doc.meta);
+                //     free(doc.body);
+                //     free(ioctx->value->value);
+                //     free(ioctx->value);
+                //     free(ioctx->key->key);
+                //     free(ioctx->key);
+                //     free(kvssd_cb_args);
+                //     atomic_decr_uint32_t(args->outstanding_reads);
+                //     free(args);
+                //     return;
+                // }
+            } else {
+                doc_offset = offset;
+            }
+
+            // If say a snapshot is taken on a db handle after
+            // rollback, then skip WAL items after rollback point
+            if ((mode == FDB_RESTORE_KV_INS || !handle->kvs) &&
+                    doc.seqnum > handle->seqnum) {
+                free(doc.key);
+                free(doc.meta);
+                free(doc.body);
+                //_recovery_free(cmd, voidargs);
+                atomic_decr_uint32_t(args->outstanding_reads);
+                free(args);
+                return;
+            }
+
+            // restore document
+            fdb_doc *wal_doc = (fdb_doc*)malloc(sizeof(fdb_doc));
+            wal_doc->keylen = doc.length.keylen;
+            wal_doc->bodylen = doc.length.bodylen;
+            wal_doc->key = doc.key;
+            wal_doc->seqnum = doc.seqnum;
+            wal_doc->deleted = doc.length.flag & DOCIO_DELETED;
+
+            fdb_log(NULL, FDB_LOG_DEBUG,
+                    FDB_RESULT_READ_FAIL,
+                    "Found doc with key %.*s in recovery. Offset %lu. length %u", 
+                    doc.length.keylen, (char*)doc.key, _offset, vlen);
+
+            if (!handle->shandle) {
+                wal_doc->metalen = doc.length.metalen;
+                wal_doc->meta = doc.meta;
+                wal_doc->size_ondisk = _fdb_get_docsize(doc.length);
+
+                if (handle->kvs) {
+                    // check seqnum before insert
+                    fdb_kvs_id_t kv_id;
+                    fdb_seqnum_t kv_seqnum;
+                    buf2kvid(handle->config.chunksize,
+                            wal_doc->key, &kv_id);
+
+                    kv_seqnum = fdb_kvs_get_seqnum(handle->file, kv_id);
+                    if (doc.seqnum <= kv_seqnum &&
+                            ((mode == FDB_RESTORE_KV_INS &&
+                              kv_id == kv_id_req) ||
+                             (mode == FDB_RESTORE_NORMAL))) {
+                        // if mode is NORMAL, restore all items
+                        // if mode is KV_INS, restore items matching ID
+                        wal_items_lock->lock();
+                        wal_items->push_back(std::make_pair(wal_doc, doc_offset));
+                        wal_items_lock->unlock();
+                        (*restored_count)++;
+                    }
+                } else {
+                    wal_items_lock->lock();
+                    wal_items->push_back(std::make_pair(wal_doc, doc_offset));
+                    wal_items_lock->unlock();
+                    (*restored_count)++;
+                }
+            } else {
+                /*
+                 * Haven't paid attention to this case yet.
+                 */
+
+                assert(0);
+                // snapshot
+                // TODO need to push action to wal_items too
+                // wal_item_action action = WAL_ACT_INSERT;
+                // if (wal_doc->deleted) action = WAL_ACT_REMOVE;
+                if (handle->kvs) {
+                    fdb_kvs_id_t kv_id;
+                    buf2kvid(handle->config.chunksize,
+                            wal_doc->key, &kv_id);
+                    if (kv_id == handle->kvs->id) {
+                        // snapshot: insert ID matched documents only
+                        wal_items_lock->lock();
+                        wal_items->push_back(std::make_pair(wal_doc, doc_offset));
+                        wal_items_lock->unlock();
+                        (*restored_count)++;
+                    } else {
+                        free(doc.key);
+                    }
+                } else {
+                    wal_items_lock->lock();
+                    wal_items->push_back(std::make_pair(wal_doc, doc_offset));
+                    wal_items_lock->unlock();
+                    (*restored_count)++;
+                }
+            }
+            free(doc.meta);
+            free(doc.body);
+            offset = _offset;
+        } else {
+            // skip transactional document or system document
+            free(doc.key);
+            free(doc.meta);
+            free(doc.body);
+            atomic_decr_uint32_t(args->outstanding_reads);
+            free(args);
+            return;
+            // do not break.. read next doc
+        }
+    } else {
+        atomic_decr_uint32_t(args->outstanding_reads);
+        free(args);
+        return;
+    }
+
+    atomic_decr_uint32_t(args->outstanding_reads);
+    free(args);
+}
+
+#ifndef __KVSSD_EMU
+void recovery_read_cb(struct nvme_passthru_kv_cmd cmd, void *voidargs)
+{
+    struct callback_args *cb_args;
+    struct recovery_item_args *args;
+
+    cb_args = (struct callback_args*)voidargs;
+    args = (struct recovery_item_args*)cb_args->args;
+
+    __recovery_read_cb(args, cmd.result, (char*)cmd.key, (char*)cmd.data_addr,
+                       cmd.data_length);
+    _recovery_free(cmd, voidargs);
+}
+#else
+void recovery_read_cb(kvs_postprocess_context* ioctx) {
+    struct callback_args *cb_args;
+    struct recovery_item_args *args;
+
+    cb_args = (struct callback_args*)ioctx->private1;
+    args = (struct recovery_item_args*)cb_args->args;
+
+    __recovery_read_cb(args, ioctx->result, (char*) ioctx->key->key,
+                       (char*) ioctx->value->value, 
+                       ioctx->value->actual_value_size);
+    _recovery_free(ioctx, args);
+}
+#endif
+struct wal_insertion_thread_args {
+    struct filemgr *file;
+    fdb_kvs_handle *handle;
+    struct _fdb_key_cmp_info cmp_info;
+    std::vector<std::pair<fdb_doc*, uint64_t>> *wal_items;
+    std::mutex *wal_items_lock;
+    atomic_uint8_t *iterating;
+    atomic_uint32_t *total_restored;
+    bool snapshot;
+};
+
+bool sortbysec(const std::pair<fdb_doc*, uint64_t> &a, 
+              const std::pair<fdb_doc*, uint64_t> &b) 
+{ 
+    return (a.second > b.second); 
+} 
+
+void * _wal_insertion_thread(void* voidargs)
+{
+    struct wal_insertion_thread_args *args;
+    struct filemgr *file;
+    fdb_kvs_handle *handle;
+    struct _fdb_key_cmp_info cmp_info;
+    std::vector<std::pair<fdb_doc*, uint64_t>> *wal_items;
+    std::mutex *wal_items_lock;
+    atomic_uint8_t *iterating;
+
+    args = (struct wal_insertion_thread_args*)voidargs;
+    file = args->file; 
+    handle = args->handle;
+    cmp_info = args->cmp_info;
+    wal_items = args->wal_items;
+    wal_items_lock = args->wal_items_lock;
+    iterating = args->iterating;
+
+    std::sort(wal_items->begin(), wal_items->end(), sortbysec);
+
+    while(1) {
+        std::pair<fdb_doc*, uint64_t> pair;
+
+        if(wal_items->empty()) {
+            return NULL;
+        }
+
+        wal_items_lock->lock();
+        pair = wal_items->back();
+        wal_items->pop_back();
+        wal_items_lock->unlock();
+
+        if(args->snapshot) {
+            wal_item_action action = WAL_ACT_INSERT;
+            if (pair.first->deleted) action = WAL_ACT_REMOVE;
+
+            wal_snap_insert(handle->shandle, pair.first,
+                            pair.second, action);
+            free(pair.first);
+        } else {
+            wal_insert(&file->global_txn, file, &cmp_info,
+                       pair.first, pair.second,
+                       WAL_INS_WRITER);
+            free(pair.first->key);
+            free(pair.first);
+        }
+        (*args->total_restored)++;
+    }
+
+    return NULL;
+}
+
+/*
+ * Delete KV pairs that potentially hit the disk before a commit completed.
+ */
+
+#define AUTO_C 32
+void __erase_outstanding_cb(struct callback_args *args) {
+    atomic_uint64_t *count;
+    count = (atomic_uint64_t*)args->args;
+    atomic_decr_uint64_t(count);
+}
+
+#ifndef __KVSSD_EMU
+void _erase_outstanding_cb(struct nvme_passthru_kv_cmd cmd, 
+                           void* voidargs) {
+    struct callback_args *args;
+    assert(cmd.result == 0);
+
+    args = (struct callback_args*)voidargs;
+    __erase_outstanding_cb(args);
+}
+#else
+void _erase_outstanding_cb(kvs_postprocess_context* ioctx) {
+    struct callback_args *args;
+    assert(ioctx->result == 0);
+
+    args = (struct callback_args*)ioctx->private1;
+    __erase_outstanding_cb(args);
+    free(ioctx->key->key);
+    free(ioctx->key);
+}
+
+#endif
+
+void _erase_outstanding_kv_pairs(struct filemgr* file, uint64_t commit_id)
+{
+    struct callback_args args;
+    atomic_uint64_t count;
+    count.store(AUTO_C);
+
+    args.args = &count;
+    args.cb = _erase_outstanding_cb;
+    for(int i = 0; i < AUTO_C; i++) {
+        uint64_t vnum = ((commit_id + 1) << 32) + i;
+        del(file, vnum, &args);
+    }
+
+    while(atomic_get_uint64_t(&count) > 0) {
+        usleep(1);
+    }
+}
+
+void _get_key_list(struct filemgr *file, uint64_t commit_id);
+INLINE void _fdb_restore_wal_kvssd(fdb_kvs_handle *handle,
+                                   fdb_restore_mode_t mode,
+                                   bid_t hdr_bid,
+                                   fdb_kvs_id_t kv_id_req)
+{
+    struct filemgr *file = handle->file;
+    uint64_t last_wal_flush_hdr_bid = handle->last_wal_flush_hdr_bid;
+    uint64_t hdr_off = hdr_bid;
+    uint64_t offset = 0; //assume everything from first vernum needs restoration
+    struct _fdb_key_cmp_info cmp_info;
+    err_log_callback *log_callback;
+
+    struct timeval  tv1, tv2;
+    gettimeofday(&tv1, NULL);
+
+    if (mode == FDB_RESTORE_NORMAL && !handle->shandle &&
+        !wal_try_restore(handle->file)) { // Atomically try to restore WAL
+        // Some other thread or previous open had successfully initialized WAL
+        // We can simply return here
+        return;
+    }
+
+    if (!hdr_off) { // Nothing to do if we don't have a header block offset
+        return;
+    }
+
+    /*
+     * hdr_bid is the last successful commit. We get the key list
+     * of the logs that were to be persisted in hdr_bid + 1 (if any)
+     * and delete them. Next, we open an iterator on commit hdr_bid + 1
+     * to delete any KV pairs that reached the disk but are ultimately
+     * to be discarded because the commit failed or was never tried
+     * to begin with.
+     */
+
+    _get_key_list(handle->file, (hdr_bid >> 32) + 1);
+    _erase_outstanding_kv_pairs(handle->file, (hdr_bid >> 32) + 1);
+
+    if (last_wal_flush_hdr_bid != BLK_NOT_FOUND) {
+        if(handle->file->config->kvssd) {
+            offset = (last_wal_flush_hdr_bid);
+        } else {
+            offset = (last_wal_flush_hdr_bid + 1);
+        }
+    }
+
+    // If a valid last header was retrieved and it matches the current header
+    if (hdr_off == offset || hdr_bid == last_wal_flush_hdr_bid) {
+        return; // No WAL section in the file
+    }
+
+    if (mode == FDB_RESTORE_NORMAL && !handle->shandle) {
+        // for normal WAL restore, set status to dirty
+        // (only when the previous status is clean or dirty)
+        wal_set_dirty_status(handle->file, FDB_WAL_DIRTY, true);
+    }
+
+    // Temporarily disable the error logging callback as there are false positive
+    // checksum errors in docio_read_doc.
+    // TODO: Need to adapt docio_read_doc to separate false checksum errors.
+    err_log_callback dummy_cb;
+    log_callback = handle->dhandle->log_callback;
+    dummy_cb.callback = fdb_dummy_log_callback;
+    dummy_cb.ctx_data = NULL;
+    handle->dhandle->log_callback = &dummy_cb;
+
+    if (!handle->shandle) {
+        filemgr_mutex_lock(file);
+    }
+    cmp_info.kvs_config = handle->kvs_config;
+    cmp_info.kvs = handle->kvs;
+
+    uint64_t commit_id = offset >> 32;
+
+    /*
+        Offset is set to last_wal_flush_hdr_bid above.
+        If a last_wal_flush_hdr_bid exists, then the data 
+        in that commit is in the tree, and we  don't need to 
+        restore it. Start from the next commit id.
+    */
+
+    if(last_wal_flush_hdr_bid != BLK_NOT_FOUND) {
+        commit_id++;
+    }
+
+    uint64_t header_commit_id = (hdr_off >> 32);
+    atomic_uint32_t total_restored;
+    total_restored = 0;
+    void *ret;
+
+    std::mutex wal_items_lock;
+    std::condition_variable wal_items_cond;
+    std::vector<std::pair<fdb_doc*, uint64_t>> *wal_items = new std::vector<std::pair<fdb_doc*, uint64_t>>();
+
+    uint32_t num_commits = header_commit_id - commit_id + 1;
+
+    /*
+        This can happen if there was only one commit for commit ID 0.
+    */
+
+    if(num_commits == 0) {
+        commit_id = 0;
+        num_commits++;
+    }
+
+    thread_t wal_insert_thread_pid;
+    struct docio_handle **dhandles = (struct docio_handle**)
+        malloc(sizeof(struct docio_handle*) * num_commits);
+    std::mutex dhandle_lock[num_commits];
+    atomic_uint8_t num_in_flight;
+    atomic_uint32_t remaining;
+    atomic_uint8_t iterating;
+    atomic_init_uint8_t(&num_in_flight, 0);
+    atomic_init_uint32_t(&remaining, 1);
+    atomic_init_uint8_t(&iterating, 1);
+
+    struct wal_insertion_thread_args *insertion_args = 
+        (struct wal_insertion_thread_args*)malloc(sizeof(struct wal_insertion_thread_args));
+
+    insertion_args->file = file;
+    insertion_args->handle = handle;
+    insertion_args->cmp_info = cmp_info;
+    insertion_args->wal_items = wal_items;
+    insertion_args->wal_items_lock = &wal_items_lock;
+    insertion_args->iterating = &iterating;
+    insertion_args->total_restored = &total_restored;
+    insertion_args->snapshot = handle->shandle ? 1 : 0;
+
+    uint32_t restored_count;
+    atomic_uint32_t outstanding_reads;
+    atomic_init_uint32_t(&outstanding_reads, 0);
+
+    fdb_log(NULL, FDB_LOG_DEBUG,
+            FDB_RESULT_SUCCESS,
+            "%u commits to restore:", 
+            num_commits);
+    for(unsigned int i = 0; i < num_commits; i++) {
+        key k = str_key(std::string("WRITES!@#$") + 
+                        std::to_string(commit_id + i));
+        void *buf = malloc(4096);
+        retrieve(file,  
+                 std::string("WRITES!@#$") + std::to_string(commit_id + i),
+                 buf, NULL);
+
+        uint64_t this_commit = (commit_id + i) << 32;
+        uint64_t to_restore = *(uint64_t*)buf;
+        fdb_log(NULL, FDB_LOG_DEBUG,
+                FDB_RESULT_SUCCESS,
+                "%lu writes for commit %lu starting %lu\n",
+                this_commit >> 32, this_commit);
+        free(buf);
+
+        dhandles[i] = (struct docio_handle*)malloc(sizeof(struct docio_handle));
+        docio_init(dhandles[i], file, false);
+
+        atomic_add_uint32_t(&outstanding_reads, to_restore);
+
+        for(unsigned int j = 1; j < to_restore + 1; j++) {
+            uint64_t offset = this_commit + j;
+
+            struct callback_args *kvssd_cb_args;
+            struct recovery_item_args *item_args;
+
+            item_args = 
+                (struct recovery_item_args*)malloc(sizeof(struct recovery_item_args));
+            kvssd_cb_args = (struct callback_args*) malloc(sizeof(*kvssd_cb_args));
+
+            kvssd_cb_args->cb = recovery_read_cb;
+            kvssd_cb_args->nested = false;
+
+            memset(item_args, 0x0, sizeof(struct recovery_item_args));
+            item_args->handle = handle;
+            item_args->wal_items = wal_items;
+            item_args->dhandle = dhandles[i];
+            item_args->offset = offset;
+            item_args->mode = mode;
+            item_args->kv_id_req = kv_id_req;
+            item_args->wal_items_lock = &wal_items_lock;
+            item_args->restored_count = &restored_count;
+            item_args->outstanding_reads = &outstanding_reads;
+            item_args->skipped = 0;
+
+            fdb_log(NULL, FDB_LOG_DEBUG,
+                    FDB_RESULT_READ_FAIL,
+                    "Sending offset %lu", 
+                    offset);
+
+            kvssd_cb_args->args = item_args;
+#ifndef __KVSSD_EMU
+            void *ret_buf = malloc(VALUE_RETRIEVE_LENGTH);
+            retrieve(file, offset, ret_buf, kvssd_cb_args);
+#else
+            retrieve(file, offset, NULL, kvssd_cb_args);
+#endif
+        }
+    }
+
+    while(atomic_get_uint32_t(&outstanding_reads) > 0) { usleep(1); }
+ 
+    thread_create(&wal_insert_thread_pid, _wal_insertion_thread, (void*)insertion_args);
+
+    atomic_store_uint8_t(&iterating, 0);
+    thread_join(wal_insert_thread_pid, &ret);
+
+    for(unsigned int i = 0; i < num_commits; i++) {
+        dhandle_lock[i].lock();
+        docio_free(dhandles[i]);
+        free(dhandles[i]);
+        dhandle_lock[i].unlock();
+    }
+
+    free(insertion_args);
+    free(dhandles);
+
+    wal_items_lock.lock();
+    delete wal_items;
+    wal_items_lock.unlock();
+
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS, 
+        "WAL restored %u items", total_restored.load());
+
+    // wal commit
+    if (!handle->shandle) {
+        wal_commit(&file->global_txn, file, NULL, &handle->log_callback);
+        filemgr_mutex_unlock(file);
+    }
+    gettimeofday(&tv2, NULL);
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS, 
+        "WAL restore time = %f seconds",
+         (double) (tv2.tv_usec - tv1.tv_usec) / 1000000 +
+         (double) (tv2.tv_sec - tv1.tv_sec));
+
+    handle->dhandle->log_callback = log_callback;
+}
 
 INLINE fdb_status _fdb_recover_compaction(fdb_kvs_handle *handle,
                                           const char *new_filename)
@@ -679,6 +1318,7 @@ fdb_status fdb_init(fdb_config *config)
 {
     fdb_config _config;
     struct filemgr_config f_config;
+    struct bgflusher_config bgf_config;
 
     if (config) {
         if (validate_fdb_config(config)) {
@@ -718,9 +1358,32 @@ fdb_status fdb_init(fdb_config *config)
 
         // initialize file manager and block cache
         f_config.blocksize = _config.blocksize;
-        f_config.ncacheblock = _config.buffercache_size / _config.blocksize;
+        f_config.index_blocksize = _config.index_blocksize;
+        f_config.ncacheblock = _config.buffercache_size / _config.index_blocksize;
         f_config.seqtree_opt = _config.seqtree_opt;
         f_config.do_not_cache_doc_blocks = _config.do_not_cache_doc_blocks;
+        f_config.kvssd = _config.kvssd;
+        f_config.logging = _config.logging;
+        f_config.kvssd_emu_config_file = _config.kvssd_emu_config_file;
+        f_config.kvssd_dev_path = _config.kvssd_dev_path;
+        f_config.kv_cache_size = _config.kv_cache_size;
+        f_config.kv_cache_doc_writes = _config.kv_cache_doc_writes;
+        f_config.kvssd_max_value_size = _config.kvssd_max_value_size;
+        f_config.background_wal_preload = _config.background_wal_preload;
+        f_config.wal_flush_preloading = _config.wal_flush_preloading;
+        f_config.max_log_threshold = _config.max_log_threshold;
+        f_config.split_threshold = _config.split_threshold;
+        f_config.delete_during_wal_flush = _config.delete_during_wal_flush;
+        f_config.log_trim_mb = _config.log_trim_mb;
+        f_config.cold_log_threshold = _config.cold_log_threshold;
+        f_config.log_trim_threshold = _config.log_trim_threshold;
+        f_config.write_index_on_close = _config.write_index_on_close;
+        f_config.max_logs_per_node = _config.max_logs_per_node;
+        f_config.num_aio_workers = _config.num_aio_workers;
+        f_config.max_outstanding = _config.max_outstanding;
+        f_config.deletion_interval = _config.deletion_interval;
+        f_config.kvssd_retrieve_length = _config.kvssd_retrieve_length;
+        f_config.async_wal_flushes = _config.async_wal_flushes;
         filemgr_init(&f_config);
 
         // WARNING: If background compactor is disabled,
@@ -746,8 +1409,8 @@ fdb_status fdb_init(fdb_config *config)
         // initialize background flusher daemon
         // Temporarily disable background flushers until blockcache contention
         // issue is resolved.
-        //bgf_config.num_threads = 0; //_config.num_bgflusher_threads;
-        //bgflusher_init(&bgf_config);
+        bgf_config.num_threads = _config.num_bgflusher_threads;
+        bgflusher_init(&bgf_config);
 
         // Initialize breakpad
         //_dbg_handle_crashes(config->breakpad_minidump_dir);
@@ -761,7 +1424,12 @@ fdb_status fdb_init(fdb_config *config)
 
 LIBFDB_API
 fdb_config fdb_get_default_config(void) {
-    return get_default_config();
+    return get_default_config_kvssd();
+}
+
+LIBFDB_API
+fdb_config fdb_get_default_config_kvssd(void) {
+    return get_default_config_kvssd();
 }
 
 LIBFDB_API
@@ -837,9 +1505,11 @@ fdb_status fdb_open(fdb_file_handle **ptr_fhandle,
         free(handle);
         fdb_file_handle_free(fhandle);
     }
+
     spin_lock(&initial_lock);
     fdb_open_inprog--;
     spin_unlock(&initial_lock);
+
     return fs;
 }
 
@@ -973,6 +1643,30 @@ fdb_status fdb_open_for_compactor(fdb_file_handle **ptr_fhandle,
     return fs;
 }
 
+INLINE int _fdb_cmp_uint64_t(const void *key1, const void *key2)
+{
+    uint64_t a,b;
+    // must ensure that key1 and key2 are pointers to uint64_t values
+    a = deref64(key1);
+    b = deref64(key2);
+
+#ifdef __BIT_CMP
+    return _CMP_U64(a, b);
+
+#else
+    if (a < b) {
+        return -1;
+    } else if (a > b) {
+        return 1;
+    } else {
+        return 0;
+    }
+#endif
+}
+
+uint64_t snapshot_vernums[65536];
+uint64_t snapshot_idx = 0;
+
 LIBFDB_API
 fdb_status fdb_snapshot_open(fdb_kvs_handle *handle_in,
                              fdb_kvs_handle **ptr_handle, fdb_seqnum_t seqnum)
@@ -1029,6 +1723,12 @@ fdb_snapshot_open_start:
     handle->log_callback = handle_in->log_callback;
     handle->max_seqnum = seqnum;
     handle->fhandle = handle_in->fhandle;
+
+    handle->max_vernum = filemgr_get_current_vernum(file);
+    file->open_snapshots_lock.lock();
+    file->open_snapshots->insert(handle->max_vernum);
+    file->snapshot_idx++;
+    file->open_snapshots_lock.unlock();
 
     config.flags |= FDB_OPEN_FLAG_RDONLY;
     // do not perform compaction for snapshot
@@ -1432,7 +2132,11 @@ fdb_status fdb_rollback_all(fdb_file_handle *fhandle,
     if (fs == FDB_RESULT_SUCCESS) {
         fdb_seqnum_t old_seqnum;
         // Restore WAL for all KV instances...
-        _fdb_restore_wal(handle, FDB_RESTORE_NORMAL, (bid_t)marker, 0);
+        if (handle->file->config->kvssd) {
+            _fdb_restore_wal_kvssd(handle, FDB_RESTORE_NORMAL, (bid_t) marker, 0);
+        } else {
+            _fdb_restore_wal(handle, FDB_RESTORE_NORMAL, (bid_t) marker, 0);
+        }
 
         // rollback the file's sequence number
         filemgr_mutex_lock(file);
@@ -1464,7 +2168,8 @@ fdb_status fdb_rollback_all(fdb_file_handle *fhandle,
 static void _fdb_init_file_config(const fdb_config *config,
                                   struct filemgr_config *fconfig) {
     fconfig->blocksize = config->blocksize;
-    fconfig->ncacheblock = config->buffercache_size / config->blocksize;
+    fconfig->index_blocksize = config->index_blocksize;
+    fconfig->ncacheblock = config->buffercache_size / config->index_blocksize;
     fconfig->chunksize = config->chunksize;
 
     fconfig->options = 0x0;
@@ -1497,6 +2202,24 @@ static void _fdb_init_file_config(const fdb_config *config,
                           config->num_keeping_headers,
                           std::memory_order_relaxed);
     fconfig->do_not_cache_doc_blocks = config->do_not_cache_doc_blocks;
+    fconfig->kvssd = config->kvssd;
+    fconfig->logging = config->logging;
+    fconfig->kvssd_emu_config_file = config->kvssd_emu_config_file;
+    fconfig->kvssd_dev_path = config->kvssd_dev_path;
+    fconfig->kv_cache_size = config->kv_cache_size;
+    fconfig->kv_cache_doc_writes = config->kv_cache_doc_writes;
+    fconfig->kvssd_max_value_size = config->kvssd_max_value_size;
+    fconfig->background_wal_preload = config->background_wal_preload;
+    fconfig->wal_flush_preloading = config->wal_flush_preloading;
+    fconfig->delete_during_wal_flush = config->delete_during_wal_flush;
+    fconfig->log_trim_mb = config->log_trim_mb;
+    fconfig->cold_log_threshold = config->cold_log_threshold;
+    fconfig->cold_log_scan_interval = config->cold_log_scan_interval;
+    fconfig->max_logs_per_node = config->max_logs_per_node;
+    fconfig->num_aio_workers = config->num_aio_workers;
+    fconfig->deletion_interval = config->deletion_interval;
+    fconfig->kvssd_retrieve_length = config->kvssd_retrieve_length;
+    fconfig->async_wal_flushes = config->async_wal_flushes;
 }
 
 fdb_status _fdb_clone_snapshot(fdb_kvs_handle *handle_in,
@@ -1541,7 +2264,7 @@ fdb_status _fdb_clone_snapshot(fdb_kvs_handle *handle_in,
     handle_out->bhandle = (struct btreeblk_handle *)
         calloc(1, sizeof(struct btreeblk_handle));
     handle_out->bhandle->log_callback = &handle_out->log_callback;
-    btreeblk_init(handle_out->bhandle, handle_out->file, handle_out->file->blocksize);
+    btreeblk_init(handle_out->bhandle, handle_out->file, handle_out->file->index_blocksize);
 
     handle_out->dirty_updates = handle_in->dirty_updates;
     atomic_store_uint64_t(&handle_out->cur_header_revnum, handle_in->cur_header_revnum);
@@ -1552,7 +2275,7 @@ fdb_status _fdb_clone_snapshot(fdb_kvs_handle *handle_in,
     // initialize the trie handle
     handle_out->trie = (struct hbtrie *)malloc(sizeof(struct hbtrie));
     hbtrie_init(handle_out->trie, handle_out->config.chunksize, OFFSET_SIZE,
-                handle_out->file->blocksize,
+                handle_out->file->index_blocksize,
                 handle_in->trie->root_bid, // Source snapshot's trie root bid
                 (void *)handle_out->bhandle, handle_out->btreeblkops,
                 (void *)handle_out->dhandle, _fdb_readkey_wrap);
@@ -1570,7 +2293,7 @@ fdb_status _fdb_clone_snapshot(fdb_kvs_handle *handle_in,
             // multi KV instance mode .. HB+trie
             handle_out->seqtrie = (struct hbtrie *)malloc(sizeof(struct hbtrie));
             hbtrie_init(handle_out->seqtrie, sizeof(fdb_kvs_id_t), OFFSET_SIZE,
-                        handle_out->file->blocksize,
+                        handle_out->file->index_blocksize,
                         handle_in->seqtrie->root_bid, // Source snapshot's seqtrie root bid
                         (void *)handle_out->bhandle, handle_out->btreeblkops,
                         (void *)handle_out->dhandle, _fdb_readseq_wrap);
@@ -1648,11 +2371,6 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
         return FDB_RESULT_TOO_LONG_FILENAME;
     }
 
-    if (filename_mode == FDB_VFILENAME &&
-        !compactor_is_valid_mode(filename, (fdb_config *)config)) {
-        return FDB_RESULT_INVALID_COMPACTION_MODE;
-    }
-
     _fdb_init_file_config(config, &fconfig);
 
     if (filename_mode == FDB_VFILENAME) {
@@ -1679,6 +2397,10 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
     // If the user is requesting legacy CRC pass that down to filemgr
     if(config->flags & FDB_OPEN_WITH_LEGACY_CRC) {
         fconfig.options |= FILEMGR_CREATE_CRC32;
+    }
+
+    if(config->compaction_mode == FDB_COMPACTION_MANUAL) {
+        fconfig.split_threshold = UINT32_MAX;   
     }
 
     handle->fileops = get_filemgr_ops();
@@ -1844,15 +2566,24 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
                 hdr_bid = BLK_NOT_FOUND;
             }
         } else {
-            hdr_bid = filemgr_get_pos(handle->file) / FDB_BLOCKSIZE;
-            dirty_data_exists = (hdr_bid >
-                        atomic_get_uint64_t(&handle->last_hdr_bid));
+            if(handle->file->config->kvssd) {
+                key k = str_key(std::string(MILESTONE_K));
+                //memcpy(k.buf, MILESTONE_K, strlen(MILESTONE_K));
+                //k.klen = strlen(MILESTONE_K);
+                //handle->file->ops_kvssd->retrieve(k, &hdr_bid, NULL);
+                retrieve(handle->file, MILESTONE_K, &hdr_bid, NULL);
+                dirty_data_exists = true;
+            } else {
+                hdr_bid = filemgr_get_pos(handle->file) / FDB_BLOCKSIZE;
+                dirty_data_exists = (hdr_bid >
+                            atomic_get_uint64_t(&handle->last_hdr_bid));
+            }
         }
 
         if (hdr_bid == BLK_NOT_FOUND ||
             (sb && hdr_bid <= sb->config->num_sb)) {
             hdr_bid = 0;
-        } else if (hdr_bid > 0) {
+        } else if (hdr_bid > 0 && !handle->file->config->kvssd) {
             --hdr_bid;
         }
 
@@ -2025,7 +2756,7 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
         handle->config.compaction_buf_maxsize = FDB_COMP_BUF_MINSIZE;
     }
 
-    btreeblk_init(handle->bhandle, handle->file, handle->file->blocksize);
+    btreeblk_init(handle->bhandle, handle->file, handle->file->index_blocksize);
 
     handle->cur_header_revnum = latest_header_revnum;
     if (header_revnum) {
@@ -2125,7 +2856,7 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
 
     handle->trie = (struct hbtrie *)malloc(sizeof(struct hbtrie));
     hbtrie_init(handle->trie, config->chunksize, OFFSET_SIZE,
-                handle->file->blocksize, trie_root_bid,
+                handle->file->index_blocksize, trie_root_bid,
                 (void *)handle->bhandle, handle->btreeblkops,
                 (void *)handle->dhandle, _fdb_readkey_wrap);
     // set aux for cmp wrapping function
@@ -2142,7 +2873,7 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
             // multi KV instance mode .. HB+trie
             handle->seqtrie = (struct hbtrie *)malloc(sizeof(struct hbtrie));
             hbtrie_init(handle->seqtrie, sizeof(fdb_kvs_id_t), OFFSET_SIZE,
-                        handle->file->blocksize, seq_root_bid,
+                        handle->file->index_blocksize, seq_root_bid,
                         (void *)handle->bhandle, handle->btreeblkops,
                         (void *)handle->dhandle, _fdb_readseq_wrap);
 
@@ -2165,7 +2896,7 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
                                     handle->config.blocksize, seq_root_bid);
             }
         }
-    }else{
+    } else {
         handle->seqtree = NULL;
     }
 
@@ -2195,15 +2926,33 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
         handle->staletree = NULL;
     }
 
+    // struct timespec tt1, tt2;
+    // unsigned long long start, end;
+
+    // clock_gettime(CLOCK_REALTIME, &tt1);
     if (handle->config.multi_kv_instances && handle->max_seqnum) {
         // restore only docs belonging to the KV instance
         // handle->kvs should not be NULL
-        _fdb_restore_wal(handle, FDB_RESTORE_KV_INS,
-                         hdr_bid, (handle->kvs)?(handle->kvs->id):(0));
+        if(handle->file->config->kvssd) {
+            // assert(0);
+                    _fdb_restore_wal_kvssd(handle, FDB_RESTORE_KV_INS,
+                             hdr_bid, (handle->kvs)?(handle->kvs->id):(0));
+        } else {
+            _fdb_restore_wal(handle, FDB_RESTORE_KV_INS,
+                             hdr_bid, (handle->kvs)?(handle->kvs->id):(0));
+        }
     } else {
         // normal restore
-        _fdb_restore_wal(handle, FDB_RESTORE_NORMAL, hdr_bid, 0);
+        if(handle->file->config->kvssd) {
+            _fdb_restore_wal_kvssd(handle, FDB_RESTORE_NORMAL, hdr_bid, 0);
+        } else {
+            _fdb_restore_wal(handle, FDB_RESTORE_NORMAL, hdr_bid, 0);
+        }
     }
+    // clock_gettime(CLOCK_REALTIME, &tt2);
+
+    // start = (tt1.tv_sec * 1000000000L)+tt1.tv_nsec;
+    // end = (tt2.tv_sec * 1000000000L)+tt2.tv_nsec;
 
     if (compacted_filename &&
         filemgr_get_file_status(handle->file) == FILE_NORMAL &&
@@ -2245,7 +2994,7 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
         // so it is OK to free it here whatever the result is.
         free(prev_filename);
     }
-
+ 
     status = btreeblk_end(handle->bhandle);
     if (status != FDB_RESULT_SUCCESS) {
         // When fdb_kvs_open() is being issued in parallel with fdb_open()
@@ -2280,6 +3029,7 @@ fdb_status _fdb_open(fdb_kvs_handle *handle,
 
     return status;
 }
+
 
 LIBFDB_API
 fdb_status fdb_set_log_callback(fdb_kvs_handle* handle,
@@ -2456,18 +3206,18 @@ INLINE uint64_t _fdb_wal_get_old_offset(void *voidhandle,
     fdb_kvs_handle *handle = (fdb_kvs_handle *)voidhandle;
     uint64_t old_offset = 0;
 
-    if (item->action == WAL_ACT_REMOVE) {
+    if (1 || item->action == WAL_ACT_REMOVE) {
         // For immediate remove, old_offset value is critical
         // so that we should get an exact value.
         hbtrie_find(handle->trie,
-                    item->header->key,
-                    item->header->keylen,
-                    (void*)&old_offset);
+                item->header->key,
+                item->header->keylen,
+                (void*)&old_offset);
     } else {
         hbtrie_find_offset(handle->trie,
-                           item->header->key,
-                           item->header->keylen,
-                           (void*)&old_offset);
+                item->header->key,
+                item->header->keylen,
+                (void*)&old_offset);
     }
     btreeblk_end(handle->bhandle);
     old_offset = _endian_decode(old_offset);
@@ -2609,17 +3359,15 @@ INLINE fdb_status _fdb_wal_flush_func(void *voidhandle,
 {
     hbtrie_result hr;
     fdb_kvs_handle *handle = (fdb_kvs_handle *)voidhandle;
-    fdb_seqnum_t _seqnum;
     fdb_kvs_id_t kv_id = 0;
     fdb_status fs = FDB_RESULT_SUCCESS;
     uint8_t *var_key = alca(uint8_t, handle->config.chunksize);
-    int size_id, size_seq;
-    uint8_t *kvid_seqnum;
-    uint64_t old_offset;
+    uint64_t old_offset = BLK_NOT_FOUND;
     int64_t _offset;
     int64_t delta;
     struct docio_object _doc;
     struct filemgr *file = handle->dhandle->file;
+    //std::tuple<void*, uint32_t, void*> map_item;
 
     memset(var_key, 0, handle->config.chunksize);
     if (handle->kvs) {
@@ -2627,6 +3375,7 @@ INLINE fdb_status _fdb_wal_flush_func(void *voidhandle,
     } else {
         kv_id = 0;
     }
+
 
     struct wal_kvs_delta_stat *kvs_delta_stat;
     struct wal_kvs_delta_stat kvs_delta_query;
@@ -2658,39 +3407,16 @@ INLINE fdb_status _fdb_wal_flush_func(void *voidhandle,
         _offset = _endian_encode(item->offset);
 
         hbtrie_insert(handle->trie,
-                      item->header->key,
-                      item->header->keylen,
-                      (void *)&_offset,
-                      (void *)&old_offset);
+                item->header->key,
+                item->header->keylen,
+                (void *)&_offset,
+                (void *)&old_offset);
 
         fs = btreeblk_end(handle->bhandle);
         if (fs != FDB_RESULT_SUCCESS) {
             return fs;
         }
         old_offset = _endian_decode(old_offset);
-
-        if (handle->config.seqtree_opt == FDB_SEQTREE_USE) {
-            _seqnum = _endian_encode(item->seqnum);
-            if (handle->kvs) {
-                // multi KV instance mode .. HB+trie
-                uint64_t old_offset_local;
-
-                size_id = sizeof(fdb_kvs_id_t);
-                size_seq = sizeof(fdb_seqnum_t);
-                kvid_seqnum = alca(uint8_t, size_id + size_seq);
-                kvid2buf(size_id, kv_id, kvid_seqnum);
-                memcpy(kvid_seqnum + size_id, &_seqnum, size_seq);
-                hbtrie_insert(handle->seqtrie, kvid_seqnum, size_id + size_seq,
-                              (void *)&_offset, (void *)&old_offset_local);
-            } else {
-                btree_insert(handle->seqtree, (void *)&_seqnum,
-                             (void *)&_offset);
-            }
-            fs = btreeblk_end(handle->bhandle);
-            if (fs != FDB_RESULT_SUCCESS) {
-                return fs;
-            }
-        }
 
         delta = handle->bhandle->nlivenodes - nlivenodes;
         kvs_delta_stat->nlivenodes += delta;
@@ -2704,57 +3430,19 @@ INLINE fdb_status _fdb_wal_flush_func(void *voidhandle,
             } else { // inserted a logical deleted doc into main index
                 ++kvs_delta_stat->ndeletes;
             }
-            kvs_delta_stat->datasize += _fdb_get_docsize(approx_doc_len);
-            kvs_delta_stat->deltasize += _fdb_get_docsize(approx_doc_len);
-        } else { // update or logical delete
-            // This block is already cached when we call HBTRIE_INSERT.
-            // No additional block access.
-            char dummy_key[FDB_MAX_KEYLEN];
-            _doc.meta = _doc.body = NULL;
-            _doc.key = &dummy_key;
-            _offset = docio_read_doc_key_meta(handle->dhandle, old_offset,
-                                              &_doc, true);
-            if (_offset < 0) {
-                return (fdb_status) _offset;
-            } else if (_offset == 0) {
-                // Note that this is not an error as old_offset is pointing to
-                // the zero-filled region in a document block.
-                return FDB_RESULT_KEY_NOT_FOUND;
-            }
-            free(_doc.meta);
-            filemgr_mark_stale(file, old_offset, _fdb_get_docsize(_doc.length));
 
-            if (!(_doc.length.flag & DOCIO_DELETED)) {//prev doc was not deleted
-                if (item->action == WAL_ACT_LOGICAL_REMOVE) { // now deleted
-                    --kvs_delta_stat->ndocs;
-                    ++kvs_delta_stat->ndeletes;
-                } // else no change (prev doc was insert, now just an update)
-            } else { // prev doc in main index was a logically deleted doc
-                if (item->action == WAL_ACT_INSERT) { // now undeleted
-                    ++kvs_delta_stat->ndocs;
-                    --kvs_delta_stat->ndeletes;
-                } // else no change (prev doc was deleted, now re-deleted)
-            }
-
-            delta = (int)_fdb_get_docsize(approx_doc_len) -
-                    (int)_fdb_get_docsize(_doc.length);
-            kvs_delta_stat->datasize += delta;
-            bid_t last_hdr_bid = atomic_get_uint64_t(&handle->last_hdr_bid);
-            if (last_hdr_bid * handle->config.blocksize < old_offset) {
-                kvs_delta_stat->deltasize += delta;
+            if(_fdb_get_docsize(approx_doc_len) < 1024) {
+                kvs_delta_stat->datasize += 1024;
+                kvs_delta_stat->deltasize += 1024;
             } else {
-                kvs_delta_stat->deltasize += (int)_fdb_get_docsize(approx_doc_len);;
+                kvs_delta_stat->datasize += _fdb_get_docsize(approx_doc_len);
+                kvs_delta_stat->deltasize += _fdb_get_docsize(approx_doc_len);
             }
 
-            // Avoid duplicates (remove previous sequence number)
-            if (handle->config.seqtree_opt == FDB_SEQTREE_USE) {
-                struct wal_stale_seq_entry *entry = (struct wal_stale_seq_entry *)
-                    calloc(1, sizeof(struct wal_stale_seq_entry));
-                entry->kv_id = kv_id;
-                entry->seqnum = _doc.seqnum;
-                avl_insert(stale_seqnum_list, &entry->avl_entry,
-                           _fdb_seq_entry_cmp);
-            }
+        } else { // update or logical delete
+           free(_doc.meta);
+           filemgr_mark_stale(file, old_offset, _fdb_get_docsize(approx_doc_len));
+           file->user_data -= VALUE_RETRIEVE_LENGTH - 1024 + sizeof(uint64_t);
         }
     } else {
         // Immediate remove
@@ -2767,57 +3455,72 @@ INLINE fdb_status _fdb_wal_flush_func(void *voidhandle,
         }
 
         if (hr == HBTRIE_RESULT_SUCCESS) {
-            // This block is already cached when we call _fdb_wal_get_old_offset
-            // No additional block access should be done.
-            char dummy_key[FDB_MAX_KEYLEN];
-            _doc.meta = _doc.body = NULL;
-            _doc.key = &dummy_key;
-            _offset = docio_read_doc_key_meta(handle->dhandle, old_offset,
-                                              &_doc, true);
-            if (_offset < 0) {
-                return (fdb_status) _offset;
-            } else if (_offset == 0) {
-                return FDB_RESULT_KEY_NOT_FOUND;
-            }
             free(_doc.meta);
-            filemgr_mark_stale(file, old_offset, _fdb_get_docsize(_doc.length));
+            filemgr_mark_stale(file, old_offset, _fdb_get_docsize(approx_doc_len));
+            file->user_data -= VALUE_RETRIEVE_LENGTH - 1024 + sizeof(uint64_t);
 
-            // Reduce the total number of docs by one
-            --kvs_delta_stat->ndocs;
-            if (_doc.length.flag & DOCIO_DELETED) {//prev deleted doc is dropped
-                --kvs_delta_stat->ndeletes;
-            }
+            /*
+             * As we did not specifically test deletes in the paper, the 
+             * functionality is barebones right now. The code below for updating
+             * store statistics would need to be looked at once more before
+             * declaring it functional.
+             */
 
-            // Reduce the total datasize by size of previously present doc
-            delta = -(int)_fdb_get_docsize(_doc.length);
-            kvs_delta_stat->datasize += delta;
-            // if multiple wal flushes happen before commit, then it's possible
-            // that this doc deleted was inserted & flushed after last commit
-            // In this case we need to update the deltasize too which tracks
-            // the amount of new data inserted between commits.
-            bid_t last_hdr_bid = atomic_get_uint64_t(&handle->last_hdr_bid);
-            if (last_hdr_bid * handle->config.blocksize < old_offset) {
-                kvs_delta_stat->deltasize += delta;
-            }
+            //char dummy_key[FDB_MAX_KEYLEN];
+            //_doc.meta = _doc.body = NULL;
+            //_doc.key = &dummy_key;
+            //
+            //memset(&_doc.length, 0x0, sizeof(_doc.length));
 
-            // remove sequence number for the removed doc
-            if (handle->config.seqtree_opt == FDB_SEQTREE_USE) {
-                struct wal_stale_seq_entry *entry = (struct wal_stale_seq_entry *)
-                    calloc(1, sizeof(struct wal_stale_seq_entry));
-                entry->kv_id = kv_id;
-                entry->seqnum = _doc.seqnum;
-                avl_insert(stale_seqnum_list, &entry->avl_entry, _fdb_seq_entry_cmp);
-            }
+            //_doc.length.keylen = 8;
+            //_doc.length.metalen = 0;
+            //_doc.length.bodylen = VALUE_RETRIEVE_LENGTH;
+            //_doc.length.bodylen_ondisk = VALUE_RETRIEVE_LENGTH;
 
-            // Update index size to new size after the remove operation
-            delta = handle->bhandle->nlivenodes - nlivenodes;
-            kvs_delta_stat->nlivenodes += delta;
+            //if (_offset < 0) {
+            //    return (fdb_status) _offset;
+            //} else if (_offset == 0) {
+            //    return FDB_RESULT_KEY_NOT_FOUND;
+            //}
+            //free(_doc.meta);
+            //filemgr_mark_stale(file, old_offset, _fdb_get_docsize(_doc.length));
 
-            // ndeltanodes measures number of new index nodes created due to
-            // this hbtrie_remove() operation
-            delta = (int)handle->bhandle->ndeltanodes - ndeltanodes;
-            delta *= handle->config.blocksize;
-            kvs_delta_stat->deltasize += delta;
+            //// Reduce the total number of docs by one
+            //--kvs_delta_stat->ndocs;
+            //if (_doc.length.flag & DOCIO_DELETED) {//prev deleted doc is dropped
+            //    --kvs_delta_stat->ndeletes;
+            //}
+
+            //// Reduce the total datasize by size of previously present doc
+            //delta = -(int)_fdb_get_docsize(_doc.length);
+            //kvs_delta_stat->datasize += delta;
+            //// if multiple wal flushes happen before commit, then it's possible
+            //// that this doc deleted was inserted & flushed after last commit
+            //// In this case we need to update the deltasize too which tracks
+            //// the amount of new data inserted between commits.
+            //bid_t last_hdr_bid = atomic_get_uint64_t(&handle->last_hdr_bid);
+            //if (last_hdr_bid * handle->config.blocksize < old_offset) {
+            //    kvs_delta_stat->deltasize += delta;
+            //}
+
+            //// remove sequence number for the removed doc
+            //if (handle->config.seqtree_opt == FDB_SEQTREE_USE) {
+            //    struct wal_stale_seq_entry *entry = (struct wal_stale_seq_entry *)
+            //        calloc(1, sizeof(struct wal_stale_seq_entry));
+            //    entry->kv_id = kv_id;
+            //    entry->seqnum = _doc.seqnum;
+            //    avl_insert(stale_seqnum_list, &entry->avl_entry, _fdb_seq_entry_cmp);
+            //}
+
+            //// Update index size to new size after the remove operation
+            //delta = handle->bhandle->nlivenodes - nlivenodes;
+            //kvs_delta_stat->nlivenodes += delta;
+
+            //// ndeltanodes measures number of new index nodes created due to
+            //// this hbtrie_remove() operation
+            //delta = (int)handle->bhandle->ndeltanodes - ndeltanodes;
+            //delta *= handle->config.blocksize;
+            //kvs_delta_stat->deltasize += delta;
         }
     }
     return FDB_RESULT_SUCCESS;
@@ -2997,6 +3700,7 @@ fdb_status fdb_check_file_reopen(fdb_kvs_handle *handle, file_status_t *status)
 static void _fdb_sync_dirty_root(fdb_kvs_handle *handle)
 {
     if (handle->config.do_not_search_wal) {
+        assert(0);
         return;
     }
 
@@ -3048,7 +3752,7 @@ fdb_status fdb_get(fdb_kvs_handle *handle, fdb_doc *doc)
     fdb_txn *txn;
     fdb_doc doc_kv;
     LATENCY_STAT_START();
-
+    
     if (!handle) {
         return FDB_RESULT_INVALID_HANDLE;
     }
@@ -3089,6 +3793,7 @@ fdb_status fdb_get(fdb_kvs_handle *handle, fdb_doc *doc)
     cmp_info.kvs = handle->kvs;
     wal_file = handle->file;
     dhandle = handle->dhandle;
+    offset = BLK_NOT_FOUND;
 
     if (handle->config.do_not_search_wal) {
         wr = FDB_RESULT_KEY_NOT_FOUND;
@@ -3106,9 +3811,15 @@ fdb_status fdb_get(fdb_kvs_handle *handle, fdb_doc *doc)
         fdb_sync_db_header(handle);
     }
 
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "Starting read for %.*s at revnum %lu vnum %lu",
+            doc->keylen, (char*) doc->key, 
+            handle->cur_header_revnum.load(), 
+            filemgr_get_current_vernum(handle->file));
+
     atomic_incr_uint64_t(&handle->op_stats->num_gets, std::memory_order_relaxed);
 
-    if (wr == FDB_RESULT_KEY_NOT_FOUND) {
+    if (offset == BLK_NOT_FOUND && wr == FDB_RESULT_KEY_NOT_FOUND) {
         _fdb_sync_dirty_root(handle);
 
         if (handle->kvs) {
@@ -3145,7 +3856,15 @@ fdb_status fdb_get(fdb_kvs_handle *handle, fdb_doc *doc)
         }
 
         _offset = docio_read_doc(dhandle, offset, &_doc, true);
-        if (_offset <= 0) {
+        if(dhandle->file->config->kvssd) {
+            if((int) _offset < 0) {
+                //fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+                //        "This read failed revnum %lu\n",
+                //        handle->cur_header_revnum.load());
+                atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
+                return _offset < 0 ? (fdb_status)_offset : FDB_RESULT_KEY_NOT_FOUND;
+            }
+        } else if (_offset <= 0) {
             atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
             return _offset < 0 ? (fdb_status)_offset : FDB_RESULT_KEY_NOT_FOUND;
         }
@@ -3165,6 +3884,7 @@ fdb_status fdb_get(fdb_kvs_handle *handle, fdb_doc *doc)
         doc->deleted = _doc.length.flag & DOCIO_DELETED;
         doc->size_ondisk = _fdb_get_docsize(_doc.length);
         doc->offset = offset;
+
 
         LATENCY_STAT_END(handle->file, FDB_LATENCY_GETS);
         atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
@@ -3836,10 +4556,9 @@ fdb_status fdb_set(fdb_kvs_handle *handle, fdb_doc *doc)
     struct docio_handle *dhandle;
     struct timeval tv;
     bool txn_enabled = false;
-    bool sub_handle = false;
     bool wal_flushed = false;
     bool immediate_remove = false;
-    file_status_t fstatus;
+    // file_status_t fstatus;
     fdb_txn *txn = handle->fhandle->root->txn;
     struct _fdb_key_cmp_info cmp_info;
     fdb_status wr = FDB_RESULT_SUCCESS;
@@ -3852,8 +4571,7 @@ fdb_status fdb_set(fdb_kvs_handle *handle, fdb_doc *doc)
                        handle->file->filename);
     }
 
-    if (!doc || doc->key == NULL ||
-        doc->keylen == 0 || doc->keylen > FDB_MAX_KEYLEN ||
+    if (!doc || doc->key == NULL || doc->keylen > 8 ||
         (doc->metalen > 0 && doc->meta == NULL) ||
         (doc->bodylen > 0 && doc->body == NULL) ||
         (handle->kvs_config.custom_cmp &&
@@ -3872,26 +4590,13 @@ fdb_status fdb_set(fdb_kvs_handle *handle, fdb_doc *doc)
     _doc.meta = doc->meta;
     _doc.body = doc->deleted ? NULL : doc->body;
 
-    if (handle->kvs) {
-        // multi KV instance mode
-        // allocate more (temporary) space for key, to store ID number
-        int size_chunk = handle->config.chunksize;
-        _doc.length.keylen = doc->keylen + size_chunk;
-        _doc.key = alca(uint8_t, _doc.length.keylen);
-        // copy ID
-        kvid2buf(size_chunk, handle->kvs->id, _doc.key);
-        // copy key
-        memcpy((uint8_t*)_doc.key + size_chunk, doc->key, doc->keylen);
-
-        if (handle->kvs->type == KVS_SUB) {
-            sub_handle = true;
-        } else {
-            sub_handle = false;
-        }
-    }
+    atomic_add_uint64_t(&handle->file->requested_by_user, doc->keylen + doc->bodylen);
 
 fdb_set_start:
     fdb_check_file_reopen(handle, NULL);
+
+    file = handle->file;
+    dhandle = handle->dhandle;
 
     size_t throttling_delay = filemgr_get_throttling_delay(handle->file);
     if (throttling_delay) {
@@ -3901,59 +4606,8 @@ fdb_set_start:
     cmp_info.kvs_config = handle->kvs_config;
     cmp_info.kvs = handle->kvs;
 
-    filemgr_mutex_lock(handle->file);
-    fdb_sync_db_header(handle);
-
-    if (filemgr_is_rollback_on(handle->file)) {
-        filemgr_mutex_unlock(handle->file);
-        atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
-        return FDB_RESULT_FAIL_BY_ROLLBACK;
-    }
-
-    file = handle->file;
-    dhandle = handle->dhandle;
-
-    fstatus = filemgr_get_file_status(file);
-    if (fstatus == FILE_REMOVED_PENDING) {
-        // we must not write into this file
-        // file status was changed by other thread .. start over
-        filemgr_mutex_unlock(file);
-        goto fdb_set_start;
-    }
-
-    if (sub_handle) {
-        // multiple KV instance mode AND sub handle
-        fdb_seqnum_t kv_seqnum = fdb_kvs_get_seqnum(file,
-                                                    handle->kvs->id);
-        if (doc->seqnum != SEQNUM_NOT_USED &&
-            doc->flags & FDB_CUSTOM_SEQNUM) { // User specified own seqnum
-            if (kv_seqnum < doc->seqnum) { // track highest seqnum in handle,kv
-                handle->seqnum = doc->seqnum;
-                fdb_kvs_set_seqnum(file, handle->kvs->id,
-                                   handle->seqnum);
-            }
-            doc->flags &= ~FDB_CUSTOM_SEQNUM; // clear flag for fdb_doc reuse
-        } else { // normal monotonically increasing sequence numbers..
-            doc->seqnum = ++kv_seqnum;
-            handle->seqnum = doc->seqnum; // keep handle's seqnum the highest
-            fdb_kvs_set_seqnum(file, handle->kvs->id, handle->seqnum);
-        }
-    } else {
-        fdb_seqnum_t kv_seqnum = filemgr_get_seqnum(file);
-        // super handle OR single KV instance mode
-        if (doc->seqnum != SEQNUM_NOT_USED &&
-            doc->flags & FDB_CUSTOM_SEQNUM) { // User specified own seqnum
-            if (kv_seqnum < doc->seqnum) { // track highest seqnum in handle,kv
-                handle->seqnum = doc->seqnum;
-                filemgr_set_seqnum(file, handle->seqnum);
-            }
-            doc->flags &= ~FDB_CUSTOM_SEQNUM; // clear flag for fdb_doc reuse
-        } else { // normal monotonically increasing sequence numbers..
-            doc->seqnum = ++kv_seqnum;
-            handle->seqnum = doc->seqnum;
-            filemgr_set_seqnum(file, handle->seqnum);
-        }
-    }
+    doc->seqnum = filemgr_assign_new_seqnum(file);
+    handle->seqnum = doc->seqnum;
     _doc.seqnum = doc->seqnum;
 
     if (doc->deleted) {
@@ -3968,12 +4622,36 @@ fdb_set_start:
         txn_enabled = true;
     }
 
+    if(file->config->kvssd) {
+        doc->vernum = _doc.vernum = filemgr_assign_new_vernum(handle->file);
+        atomic_incr_uint64_t(&file->pos);
+    }
+
     offset = docio_append_doc(dhandle, &_doc, doc->deleted, txn_enabled);
     if (offset == BLK_NOT_FOUND) {
         filemgr_mutex_unlock(file);
         atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
         return FDB_RESULT_WRITE_FAIL;
     }
+
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "Wrote %.*s to %lu (%lu %lu)", doc->keylen,
+            (char*) doc->key, doc->vernum, 
+            doc->vernum >> 32, doc->vernum & 0xFFFFFFFF);
+
+    atomic_add_uint64_t(&handle->file->user_data, 
+                        doc->bodylen + doc->metalen + doc->keylen);
+
+    filemgr_mutex_lock(handle->file);
+    fdb_sync_db_header(handle);
+
+    if (filemgr_is_rollback_on(handle->file)) {
+        filemgr_mutex_unlock(handle->file);
+        atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
+        return FDB_RESULT_FAIL_BY_ROLLBACK;
+    }
+
+    file->writes_this_commit++;
 
     if (doc->deleted && !handle->config.purging_interval) {
         // immediately remove from hbtrie upon WAL flush
@@ -4065,7 +4743,6 @@ fdb_set_start:
             wal_release_flushed_items(file, &flush_items);
 
             wal_flushed = true;
-            btreeblk_reset_subblock_info(handle->bhandle);
         }
     }
 
@@ -4083,6 +4760,7 @@ fdb_set_start:
                            false); // asynchronous commit only
     }
     atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
+    
     return FDB_RESULT_SUCCESS;
 }
 
@@ -4381,6 +5059,124 @@ fdb_status fdb_commit_non_durable(fdb_file_handle *fhandle,
     return _fdb_commit( fhandle->root, opt, false );
 }
 
+struct btreeblk_addr{
+    void *addr;
+    struct list_elem le;
+};
+
+struct btreeblk_block {
+    bid_t bid;
+    int sb_no;
+    uint32_t pos;
+    uint8_t dirty;
+    uint8_t age;
+    void *addr;
+    struct list_elem le;
+    struct avl_node avl;
+#ifdef __BTREEBLK_BLOCKPOOL
+    struct btreeblk_addr *addr_item;
+#endif
+};
+
+void _signal_flush(struct filemgr *file)
+{
+    struct timeval t1, t2;
+    gettimeofday(&t1, NULL);
+    std::lock_guard<std::mutex> lock(file->flush_lock);
+    file->ready = true;
+    file->flush_cond.notify_all();
+    gettimeofday(&t2, NULL);
+}
+
+/* As we don't know which logs hit the disk before the crash,
+ * we persist a key list of the logs to-be-written this flush
+ * so that they can be deleted on recovery.
+ */
+
+uint32_t PAIR_SIZE = sizeof(uint64_t) + sizeof(uint16_t);
+void _get_key_list(struct filemgr *file, uint64_t commit_id)
+{
+    uint8_t* buf;
+    ssize_t len;
+    ssize_t ret;
+    uint64_t bid;
+    uint16_t log_num;
+    fdb_status s;
+
+    buf = (uint8_t*) malloc(MAX_VALUE_SIZE);
+
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "Trying to get key list KEYS%u during recovery", 
+            commit_id);
+
+    len = retrieve(file, std::string("KEYS") + std::to_string(commit_id),
+                   buf, NULL);
+    
+    if(len != 0) {
+        fdb_log(NULL, FDB_LOG_FATAL, FDB_RESULT_SUCCESS,
+                "We found a set of KV pairs and/or logs for the failed commit");
+
+        for(int i = 0; i < len / PAIR_SIZE; i++) {
+            bid = *(uint64_t*) (buf + (i * PAIR_SIZE));
+            log_num = *(uint16_t*) (buf + (i * PAIR_SIZE) + sizeof(uint64_t));
+
+            fdb_log(NULL, FDB_LOG_FATAL, FDB_RESULT_SUCCESS,
+            "Found %lu %lu", bid, log_num);
+
+            s = del(file, bid, log_num, NULL);
+        }
+    }
+
+    free(buf);
+}
+
+void _persist_key_list(struct filemgr *file)
+{
+    std::string k;
+    uint8_t *value;
+    uint32_t vlen;
+    uint32_t count;
+    uint16_t log_num;
+    uint64_t commit_id;
+    std::unordered_map<uint64_t, std::string> outstanding_logs_copy;
+
+    while(atomic_get_uint8_t(&file->flushing)) {
+        usleep(1);
+    }
+
+    if(file->outstanding_logs->size() == 0) {
+        return;
+    }
+
+    vlen = file->outstanding_logs->size() * PAIR_SIZE;
+    value = (uint8_t*) malloc(vlen);
+    count = 0;
+    commit_id = file->header.revnum;
+
+    outstanding_logs_copy = *file->outstanding_logs;
+    std::unordered_map<uint64_t, std::string>::iterator i;
+    for(i = outstanding_logs_copy.begin(); i != outstanding_logs_copy.end(); i++) {
+        k = std::to_string(i->first);
+
+        auto it = file->logs_per_node->find(i->first);
+        if(it == file->logs_per_node->end()) {
+            log_num = 0;
+        } else {
+            log_num = file->logs_per_node->find(i->first)->second;
+        }
+
+        k.append(log_num, sizeof(uint16_t));
+        memcpy(value + (count * PAIR_SIZE), &i->first, sizeof(uint64_t));
+        memcpy(value + (count * PAIR_SIZE) + sizeof(uint64_t), &log_num, sizeof(uint16_t));
+        count++;    
+    }
+
+    auto ret = store(file, std::string("KEYS") + std::to_string(commit_id), 
+                     value, vlen, NULL);
+    assert(ret == vlen);
+    free(value);
+}
+
 fdb_status _fdb_commit(fdb_kvs_handle *handle,
                        fdb_commit_opt_t opt,
                        bool sync)
@@ -4399,6 +5195,7 @@ fdb_status _fdb_commit(fdb_kvs_handle *handle,
     bid_t dirty_seqtree_root = BLK_NOT_FOUND;
     union wal_flush_items flush_items;
     fdb_status wr = FDB_RESULT_SUCCESS;
+
     LATENCY_STAT_START();
 
     if (handle->kvs) {
@@ -4419,6 +5216,9 @@ fdb_status _fdb_commit(fdb_kvs_handle *handle,
     }
 
 fdb_commit_start:
+    struct timeval t1, t2;
+    gettimeofday(&t1, NULL); 
+
     fdb_check_file_reopen(handle, NULL);
     filemgr_mutex_lock(handle->file);
     fdb_sync_db_header(handle);
@@ -4438,6 +5238,7 @@ fdb_commit_start:
     }
 
     fs = btreeblk_end(handle->bhandle);
+
     if (fs != FDB_RESULT_SUCCESS) {
         filemgr_mutex_unlock(handle->file);
         atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
@@ -4474,13 +5275,18 @@ fdb_commit_start:
 
         struct filemgr_dirty_update_node *prev_node = NULL, *new_node = NULL;
 
+        atomic_store_uint8_t(&handle->file->force_discard, 1);
         _fdb_dirty_update_ready(handle, &prev_node, &new_node,
-                                &dirty_idtree_root, &dirty_seqtree_root, false);
+                &dirty_idtree_root, &dirty_seqtree_root, false);
+
+        atomic_store_uint8_t(&handle->file->log_del_shutdown, 1);
 
         wr = wal_flush(handle->file, (void *)handle,
-                       _fdb_wal_flush_func, _fdb_wal_get_old_offset,
-                       _fdb_wal_flush_seq_purge, _fdb_wal_flush_kvs_delta_stats,
-                       &flush_items);
+                _fdb_wal_flush_func, _fdb_wal_get_old_offset,
+                _fdb_wal_flush_seq_purge, _fdb_wal_flush_kvs_delta_stats,
+                &flush_items);
+
+        _persist_key_list(handle->file);
 
         if (wr != FDB_RESULT_SUCCESS) {
             btreeblk_clear_dirty_update(handle->bhandle);
@@ -4495,6 +5301,7 @@ fdb_commit_start:
 
         _fdb_dirty_update_finalize(handle, prev_node, new_node,
                                    &dirty_idtree_root, &dirty_seqtree_root, true);
+        _signal_flush(handle->file);
     }
 
     // Note: Appending KVS header must be done after flushing WAL
@@ -4505,7 +5312,7 @@ fdb_commit_start:
     }
 
     filemgr_header_revnum_t next_revnum;
-    next_revnum = filemgr_get_header_revnum(handle->file)+1;
+    next_revnum = filemgr_get_header_revnum(handle->file) + 1;
 
     if (handle->rollback_revnum) {
         // if this commit is called by rollback API,
@@ -4514,21 +5321,14 @@ fdb_commit_start:
         handle->rollback_revnum = 0;
     }
 
-    if (wal_flushed) {
-        fdb_gather_stale_blocks(handle,
-                                next_revnum,
-                                atomic_get_uint64_t(&handle->last_hdr_bid),
-                                handle->kv_info_offset,
-                                filemgr_get_seqnum(handle->file),
-                                NULL, false);
-    }
-
     // Note: Getting header BID must be done after
     //       all other data are written into the file!!
     //       Or, header BID inconsistency will occur (it will
     //       point to wrong block).
-    bid_t last_hdr_bid = filemgr_alloc(handle->file, &handle->log_callback);
+    bid_t last_hdr_bid;
+    last_hdr_bid = filemgr_alloc(handle->file, &handle->log_callback);
     atomic_store_uint64_t(&handle->last_hdr_bid, last_hdr_bid);
+
     cur_bmp_revnum = sb_get_bmp_revnum(handle->file);
 
     if (wal_get_dirty_status(handle->file) == FDB_WAL_CLEAN) {
@@ -4601,12 +5401,13 @@ fdb_commit_start:
     // file commit
     fs = filemgr_commit_bid(handle->file, handle->last_hdr_bid,
                             cur_bmp_revnum, sync, &handle->log_callback);
+    // Q: why set file header twice?
+    handle->cur_header_revnum = fdb_set_file_header(handle, false);
+
+    gettimeofday(&t2, NULL);
     if (wal_flushed) {
         wal_release_flushed_items(handle->file, &flush_items);
     }
-    handle->cur_header_revnum = fdb_set_file_header(handle, true);
-
-    btreeblk_reset_subblock_info(handle->bhandle);
 
     handle->dirty_updates = 0;
     filemgr_mutex_unlock(handle->file);
@@ -4747,7 +5548,6 @@ static fdb_status _fdb_commit_and_remove_pending(fdb_kvs_handle *handle,
     // They will be cleaned up later.
     filemgr_close(old_file, 0, handle->filename, &handle->log_callback);
 
-    btreeblk_reset_subblock_info(handle->bhandle);
 
     filemgr_mutex_unlock(new_file);
 
@@ -4762,27 +5562,6 @@ static fdb_status _fdb_commit_and_remove_pending(fdb_kvs_handle *handle,
         atomic_cas_uint8_t(&handle->handle_busy, 0, 1);
     }
     return status;
-}
-
-INLINE int _fdb_cmp_uint64_t(const void *key1, const void *key2)
-{
-    uint64_t a,b;
-    // must ensure that key1 and key2 are pointers to uint64_t values
-    a = deref64(key1);
-    b = deref64(key2);
-
-#ifdef __BIT_CMP
-    return _CMP_U64(a, b);
-
-#else
-    if (a < b) {
-        return -1;
-    } else if (a > b) {
-        return 1;
-    } else {
-        return 0;
-    }
-#endif
 }
 
 static fdb_status _fdb_move_wal_docs(fdb_kvs_handle *handle,
@@ -6007,7 +6786,6 @@ _fdb_compact_move_docs_upto_marker(fdb_kvs_handle *rhandle,
     fs = filemgr_commit(new_handle.file, false, // asynchronous commit is ok
                         log_callback);
     btreeblk_end(handle.bhandle);
-    btreeblk_reset_subblock_info(new_handle.bhandle);
 
     handle.shandle = NULL;
     _fdb_close(&handle);
@@ -6500,7 +7278,6 @@ static fdb_status _fdb_compact_move_delta(fdb_kvs_handle *handle,
                             new_file->filename);
                     return fs;
                 }
-                btreeblk_reset_subblock_info(new_handle.bhandle);
             }
 
         } else {
@@ -6902,7 +7679,7 @@ static fdb_status _fdb_reset(fdb_kvs_handle *handle, fdb_kvs_handle *handle_in)
         return s;
     }
 
-    btreeblk_init(new_bhandle, handle->file, handle->file->blocksize);
+    btreeblk_init(new_bhandle, handle->file, handle->file->index_blocksize);
 
     new_trie = (struct hbtrie *)malloc(sizeof(struct hbtrie));
     if (!new_trie) { // LCOV_EXCL_START
@@ -6912,7 +7689,7 @@ static fdb_status _fdb_reset(fdb_kvs_handle *handle, fdb_kvs_handle *handle_in)
         return FDB_RESULT_ALLOC_FAIL;
     } // LCOV_EXCL_STOP
     hbtrie_init(new_trie, handle->trie->chunksize, handle->trie->valuelen,
-                handle->file->blocksize, BLK_NOT_FOUND,
+                handle->file->index_blocksize, BLK_NOT_FOUND,
                 (void *)new_bhandle, handle->btreeblkops,
                 (void*)new_dhandle, _fdb_readkey_wrap);
 
@@ -6935,7 +7712,7 @@ static fdb_status _fdb_reset(fdb_kvs_handle *handle, fdb_kvs_handle *handle_in)
             } // LCOV_EXCL_STOP
 
             hbtrie_init(new_seqtrie, sizeof(fdb_kvs_id_t),
-                        OFFSET_SIZE, handle->file->blocksize, BLK_NOT_FOUND,
+                        OFFSET_SIZE, handle->file->index_blocksize, BLK_NOT_FOUND,
                         (void *)new_bhandle, handle->btreeblkops,
                         (void *)new_dhandle, _fdb_readseq_wrap);
         } else {
@@ -6971,7 +7748,8 @@ static fdb_status _fdb_reset(fdb_kvs_handle *handle, fdb_kvs_handle *handle_in)
         }
     }
 
-    if (ver_staletree_support(ver_get_latest_magic())) {
+    if (!handle->file->config->kvssd 
+        && ver_staletree_support(ver_get_latest_magic())) {
         struct btree_kv_ops *stale_kv_ops =
             (struct btree_kv_ops *)malloc(sizeof(struct btree_kv_ops));
         if (!stale_kv_ops) { // LCOV_EXCL_START
@@ -7129,11 +7907,11 @@ fdb_status fdb_compact_file(fdb_file_handle *fhandle,
         return status;
     }
 
-    btreeblk_init(new_bhandle, new_file, new_file->blocksize);
+    btreeblk_init(new_bhandle, new_file, new_file->index_blocksize);
 
     new_trie = (struct hbtrie *)malloc(sizeof(struct hbtrie));
     hbtrie_init(new_trie, handle->trie->chunksize, handle->trie->valuelen,
-                new_file->blocksize, BLK_NOT_FOUND,
+                new_file->index_blocksize, BLK_NOT_FOUND,
                 (void *)new_bhandle, handle->btreeblkops,
                 (void*)new_dhandle, _fdb_readkey_wrap);
 
@@ -7149,7 +7927,7 @@ fdb_status fdb_compact_file(fdb_file_handle *fhandle,
             new_seqtrie = (struct hbtrie *)calloc(1, sizeof(struct hbtrie));
 
             hbtrie_init(new_seqtrie, sizeof(fdb_kvs_id_t),
-                        OFFSET_SIZE, new_file->blocksize, BLK_NOT_FOUND,
+                        OFFSET_SIZE, new_file->index_blocksize, BLK_NOT_FOUND,
                         (void *)new_bhandle, handle->btreeblkops,
                         (void *)new_dhandle, _fdb_readseq_wrap);
         } else {
@@ -7275,7 +8053,6 @@ fdb_status _fdb_compact_file(fdb_kvs_handle *handle,
         return fs;
     }
 
-    btreeblk_reset_subblock_info(handle->bhandle);
 
     if (handle->file->sb) {
         // sync superblock
@@ -7324,7 +8101,6 @@ fdb_status _fdb_compact_file(fdb_kvs_handle *handle,
     if (fs != FDB_RESULT_SUCCESS) {
         filemgr_set_compaction_state(handle->file, NULL, FILE_NORMAL);
 
-        btreeblk_reset_subblock_info(new_bhandle);
         _fdb_cleanup_compact_err(handle, new_file, true, false, new_bhandle,
                                  new_dhandle, new_trie, new_seqtrie,
                                  new_seqtree, new_staletree);
@@ -7396,7 +8172,6 @@ fdb_status _fdb_compact_file(fdb_kvs_handle *handle,
             if (got_lock) {
                 filemgr_mutex_unlock(handle->file);
             }
-            btreeblk_reset_subblock_info(new_bhandle);
             _fdb_cleanup_compact_err(handle, new_file, true, false,
                                      new_bhandle, new_dhandle, new_trie,
                                      new_seqtrie, new_seqtree, new_staletree);
@@ -7464,7 +8239,6 @@ fdb_status _fdb_compact_file(fdb_kvs_handle *handle,
         filemgr_set_compaction_state(handle->file, NULL, FILE_NORMAL);
         filemgr_mutex_unlock(handle->file);
         filemgr_mutex_unlock(new_file);
-        btreeblk_reset_subblock_info(new_bhandle);
         _fdb_cleanup_compact_err(handle, new_file, true, false, new_bhandle,
                                  new_dhandle, new_trie, new_seqtrie,
                                  new_seqtree, new_staletree);
@@ -7546,37 +8320,44 @@ static fdb_status _fdb_compact(fdb_file_handle *fhandle,
     bool in_place_compaction = false;
     char nextfile[FDB_MAX_FILENAME_LEN];
     fdb_status fs;
+    // struct list_elem *e;
 
     if (!atomic_cas_uint8_t(&handle->handle_busy, 0, 1)) {
         return FDB_RESULT_HANDLE_BUSY;
     }
 
-    if (handle->config.compaction_mode == FDB_COMPACTION_MANUAL) {
-        // manual compaction
-        if (!new_filename) { // In-place compaction.
-            in_place_compaction = true;
+    if (handle->config.kvssd) {
+        atomic_incr_uint64_t(&handle->op_stats->num_compacts, std::memory_order_relaxed);
+        return FDB_RESULT_SUCCESS;
+    } else {
+        if (handle->config.compaction_mode == FDB_COMPACTION_MANUAL) {
+            // manual compaction
+            if (!new_filename) { // In-place compaction.
+                in_place_compaction = true;
+                compactor_get_next_filename(handle->file->filename, nextfile);
+                new_filename = nextfile;
+            }
+            fs = fdb_compact_file(fhandle, new_filename, in_place_compaction,
+                    (bid_t) marker, clone_docs, new_encryption_key, opt);
+        } else { // auto compaction mode.
+            bool ret;
+            // set compaction flag
+            ret = compactor_switch_compaction_flag(handle->file, true);
+            if (!ret) {
+                atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
+                // the file is already being compacted by other thread
+                return FDB_RESULT_FILE_IS_BUSY;
+            }
+            // get next filename
             compactor_get_next_filename(handle->file->filename, nextfile);
-            new_filename = nextfile;
+            fs = fdb_compact_file(fhandle, nextfile, in_place_compaction,
+                    (bid_t) marker, clone_docs, new_encryption_key, opt);
+            // clear compaction flag
+            ret = compactor_switch_compaction_flag(handle->file, false);
+            (void) ret;
         }
-        fs = fdb_compact_file(fhandle, new_filename, in_place_compaction,
-                              (bid_t)marker, clone_docs, new_encryption_key, opt);
-    } else { // auto compaction mode.
-        bool ret;
-        // set compaction flag
-        ret = compactor_switch_compaction_flag(handle->file, true);
-        if (!ret) {
-            atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
-            // the file is already being compacted by other thread
-            return FDB_RESULT_FILE_IS_BUSY;
-        }
-        // get next filename
-        compactor_get_next_filename(handle->file->filename, nextfile);
-        fs = fdb_compact_file(fhandle, nextfile, in_place_compaction,
-                              (bid_t)marker, clone_docs, new_encryption_key, opt);
-        // clear compaction flag
-        ret = compactor_switch_compaction_flag(handle->file, false);
-        (void)ret;
     }
+
     atomic_cas_uint8_t(&handle->handle_busy, 1, 0);
     return fs;
 }
@@ -7586,6 +8367,12 @@ fdb_status fdb_compact(fdb_file_handle *fhandle,
                        const char *new_filename)
 {
     return _fdb_compact(fhandle, new_filename, BLK_NOT_FOUND, false, NULL, NULL);
+}
+
+LIBFDB_API
+fdb_status fdb_compact_kvssd(fdb_file_handle *fhandle)
+{
+    return _fdb_compact(fhandle, NULL, BLK_NOT_FOUND, false, NULL, NULL);
 }
 
 LIBFDB_API
@@ -7609,6 +8396,13 @@ fdb_status fdb_compact_upto(fdb_file_handle *fhandle,
                             fdb_snapshot_marker_t marker)
 {
     return _fdb_compact(fhandle, new_filename, marker, false, NULL, NULL);
+}
+
+LIBFDB_API
+fdb_status fdb_compact_upto_kvssd(fdb_file_handle *fhandle,
+                            fdb_snapshot_marker_t marker)
+{
+    return _fdb_compact(fhandle, NULL, marker, false, NULL, NULL);
 }
 
 LIBFDB_API
@@ -7639,7 +8433,7 @@ fdb_status fdb_switch_compaction_mode(fdb_file_handle *fhandle,
     fdb_status fs;
     fdb_kvs_handle *handle = fhandle->root;
     fdb_config config;
-    char vfilename[FDB_MAX_FILENAME_LEN];
+    char vfilename[FDB_MAX_FILENAME_LEN - 16];
     char filename[FDB_MAX_FILENAME_LEN];
     char metafile[FDB_MAX_FILENAME_LEN];
 
@@ -7765,6 +8559,7 @@ fdb_status fdb_close(fdb_file_handle *fhandle)
     } else {
         filemgr_fhandle_add(fhandle->root->file, fhandle);
     }
+
     return fs;
 }
 
@@ -7800,6 +8595,15 @@ fdb_status _fdb_close_root(fdb_kvs_handle *handle)
         }
     }
 
+    // /*
+    //     If fdb_close is called without fdb_kvs_close
+    //     then the handles can still be active.
+    // */
+
+    // if(!(handle->fhandle->root->config.flags & FDB_OPEN_FLAG_RDONLY)) {
+    //     bgflusher_deregister_kv_handle("default");
+    // }
+
     fs = _fdb_close(handle);
     if (fs == FDB_RESULT_SUCCESS) {
         fdb_kvs_info_free(handle);
@@ -7816,6 +8620,7 @@ fdb_status _fdb_close(fdb_kvs_handle *handle)
             // read-only file is not registered in compactor
             compactor_deregister_file(handle->file);
         }
+        // bgflusher_deregister_kv_handle(handle);
         bgflusher_deregister_file(handle->file);
     }
 
@@ -7827,6 +8632,19 @@ fdb_status _fdb_close(fdb_kvs_handle *handle)
         filemgr_dirty_update_close_node(handle->file,
             btreeblk_get_dirty_update(handle->bhandle));
         btreeblk_clear_dirty_update(handle->bhandle);
+
+        handle->file->open_snapshots_lock.lock();
+        handle->file->open_snapshots->erase(handle->max_vernum);
+        //for(unsigned int i = 0; i < handle->file->snapshot_idx; i++) {
+        //    if(handle->file->open_snapshots[i] == handle->max_vernum) {
+        //        for(unsigned int j = i; j < handle->file->snapshot_idx - 1; j++) {
+        //            handle->file->open_snapshots[j] = handle->file->open_snapshots[j + 1];
+        //        }
+        //        handle->file->open_snapshots[handle->file->snapshot_idx - 1] = 0;
+        //        handle->file->snapshot_idx--;
+        //    }
+        //}
+        handle->file->open_snapshots_lock.unlock();
     }
 
     fs = filemgr_close(handle->file, handle->config.cleanup_cache_onclose,
@@ -7958,7 +8776,7 @@ size_t fdb_estimate_space_used(fdb_file_handle *fhandle)
 {
     size_t ret = 0;
     size_t datasize;
-    size_t nlivenodes;
+    //size_t nlivenodes;
     fdb_kvs_handle *handle = NULL;
     struct filemgr *file;
 
@@ -7974,11 +8792,16 @@ size_t fdb_estimate_space_used(fdb_file_handle *fhandle)
     file = handle->file;
 
     datasize = _kvs_stat_get_sum(file, KVS_STAT_DATASIZE);
-    nlivenodes = _kvs_stat_get_sum(file, KVS_STAT_NLIVENODES);
+    //nlivenodes = _kvs_stat_get_sum(file, KVS_STAT_NLIVENODES);
 
     ret = datasize;
-    ret += nlivenodes * handle->config.blocksize;
-    ret += wal_get_datasize(handle->file);
+    //ret += nlivenodes * handle->config.blocksize;
+    ret += wal_get_datasize(file);
+    ret += atomic_get_uint64_t(&file->logs_occupied_space);
+
+    ret = atomic_get_uint64_t(&file->data_in_kvssd);
+
+    //printf("Logs are taking up %luMB\n", file->logs_occupied_space >> 20);
 
     return ret;
 }
@@ -8147,8 +8970,6 @@ fdb_status fdb_get_file_info(fdb_file_handle *fhandle, fdb_file_info *info)
     }
 
     info->space_used = fdb_estimate_space_used(fhandle);
-    info->file_size = filemgr_get_pos(handle->file);
-
     // Get the number of KV store instances in a given ForestDB file.
     struct kvs_header *kv_header = handle->file->kv_header;
     size_t num = 1; // default KV store.
@@ -8158,6 +8979,21 @@ fdb_status fdb_get_file_info(fdb_file_handle *fhandle, fdb_file_info *info)
         spin_unlock(&kv_header->lock);
     }
     info->num_kv_stores = num;
+
+    info->app_write_amp = (double) 
+    atomic_get_uint64_t(&handle->file->written_to_kvssd) / 
+    atomic_get_uint64_t(&handle->file->requested_by_user);
+    info->user_data = atomic_get_uint64_t(&handle->file->user_data);
+
+    uint64_t total_log_data = 0;
+    //mutex_lock(&handle->file->log_lock);
+    //for(auto i : *handle->file->logs_per_node) {
+    //    total_log_data += i.second * (LOG_LENGTH / 2);
+    //}
+    //mutex_unlock(&handle->file->log_lock);
+
+    info->file_size = atomic_get_uint64_t(&handle->file->data_in_kvssd) +
+                      total_log_data;
 
     info->sb_bmp_revnum = sb_get_bmp_revnum(handle->file);
 
@@ -8339,6 +9175,15 @@ size_t fdb_get_buffer_cache_used() {
 }
 
 LIBFDB_API
+size_t fdb_get_kv_cache_used() {
+    if (!fdb_initialized) {
+        return 0;
+    }
+
+    return (size_t) filemgr_get_kvcache_used_space();
+}
+
+LIBFDB_API
 fdb_status fdb_cancel_compaction(fdb_file_handle *fhandle)
 {
     if (!fhandle) {
@@ -8408,7 +9253,7 @@ fdb_status fdb_shutdown()
             return FDB_RESULT_FILE_IS_BUSY;
         }
         compactor_shutdown();
-        //bgflusher_shutdown();
+        bgflusher_shutdown();
         ret = filemgr_shutdown();
         if (ret == FDB_RESULT_SUCCESS) {
 #ifdef _MEMPOOL
@@ -8512,6 +9357,20 @@ int fdb_validate_files(const size_t num_filenames,
     return valid_file_number;
 }
 
+LIBFDB_API
+void fdb_print_stats()
+{
+}
+
+LIBFDB_API
+void fdb_get_stats(char* buf)
+{
+}
+
+LIBFDB_API
+void fdb_reset_stats()
+{
+}
 
 void _fdb_dump_handle(fdb_kvs_handle *h) {
     fprintf(stderr, "filename: %s\n", h->filename);

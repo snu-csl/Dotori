@@ -5,6 +5,7 @@ SET(FORESTDB_COMMON_CORE_SRC
     ${PROJECT_SOURCE_DIR}/src/avltree.cc
     ${PROJECT_SOURCE_DIR}/src/bgflusher.cc
     ${PROJECT_SOURCE_DIR}/src/blockcache.cc
+    ${PROJECT_SOURCE_DIR}/src/kv_data_cache.cc
     ${PROJECT_SOURCE_DIR}/${BREAKPAD_SRC}
     ${PROJECT_SOURCE_DIR}/src/btree.cc
     ${PROJECT_SOURCE_DIR}/src/btree_kv.cc
@@ -19,6 +20,7 @@ SET(FORESTDB_COMMON_CORE_SRC
     ${PROJECT_SOURCE_DIR}/src/encryption_aes.cc
     ${PROJECT_SOURCE_DIR}/src/encryption_bogus.cc
     ${PROJECT_SOURCE_DIR}/src/fdb_errors.cc
+    ${PROJECT_SOURCE_DIR}/src/kvssdmgr.cc
     ${PROJECT_SOURCE_DIR}/src/filemgr.cc
     ${PROJECT_SOURCE_DIR}/src/forestdb.cc
     ${PROJECT_SOURCE_DIR}/src/hash.cc
@@ -49,7 +51,7 @@ target_link_libraries(fdb_anomaly_test ${PTHREAD_LIB} ${LIBM}
                       ${SNAPPY_LIBRARIES} ${ASYNC_IO_LIB}
                       ${MALLOC_LIBRARIES} ${PLATFORM_LIBRARY}
                       ${LIBRT} ${CRYPTO_LIB}
-                      ${DL_LIBRARIES} ${BREAKPAD_LIBRARIES})
+                      ${DL_LIBRARIES} ${BREAKPAD_LIBRARIES} ${KVAPI_LIBRARIES})
 set_target_properties(fdb_anomaly_test PROPERTIES COMPILE_FLAGS "-D_FDB_TOOLS")
 
 add_executable(disk_sim_test
@@ -63,7 +65,7 @@ target_link_libraries(disk_sim_test ${PTHREAD_LIB} ${LIBM}
                       ${SNAPPY_LIBRARIES} ${ASYNC_IO_LIB}
                       ${MALLOC_LIBRARIES} ${PLATFORM_LIBRARY}
                       ${LIBRT} ${CRYPTO_LIB}
-                      ${DL_LIBRARIES} ${BREAKPAD_LIBRARIES})
+                      ${DL_LIBRARIES} ${BREAKPAD_LIBRARIES} ${KVAPI_LIBRARIES})
 set_target_properties(disk_sim_test PROPERTIES COMPILE_FLAGS "-D_FDB_TOOLS")
 
 # add test target

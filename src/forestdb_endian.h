@@ -100,18 +100,7 @@
     #define _dec16(v) (v)
 #endif
 
-#ifdef __ENDIAN_SAFE
-#define _endian_encode(v) \
-    ((sizeof(v) == 8)?(_enc64(v)):( \
-     (sizeof(v) == 4)?(_enc32(v)):( \
-     (sizeof(v) == 2)?(_enc16(v)):(v))))
-#define _endian_decode(v) \
-    ((sizeof(v) == 8)?(_dec64(v)):( \
-     (sizeof(v) == 4)?(_dec32(v)):( \
-     (sizeof(v) == 2)?(_dec16(v)):(v))))
-#else
 #define _endian_encode(v) (v)
 #define _endian_decode(v) (v)
-#endif
 
 #endif

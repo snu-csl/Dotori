@@ -18,6 +18,7 @@
 #ifndef _JSAHN_COMMON_H
 #define _JSAHN_COMMON_H
 
+#include <memory>
 #include <stdlib.h>
 #include <stdint.h>
 
@@ -84,7 +85,6 @@ struct docblk_meta {
 
 #define random_custom(prev, num) (prev) = ((prev)+811)&((num)-1)
 
-
 /* Custom assert */
 
 void fdb_assert_die(const char* expression, const char* file, int line,
@@ -93,5 +93,7 @@ void fdb_assert_die(const char* expression, const char* file, int line,
 #define fdb_assert(cond, val, expected)   \
     ((void)((cond) ? (void)0 : fdb_assert_die(#cond, __FILE__, __LINE__,\
                                               (uint64_t)(val), (uint64_t)(expected))))
+
+uint64_t get_timestamp();
 
 #endif // _JSAHN_COMMON_H

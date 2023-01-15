@@ -28,6 +28,78 @@ extern "C" {
 typedef uint16_t keylen_t;
 typedef uint32_t timestamp_t;
 
+struct async_read_ctx_t
+{
+    /*
+        Common structures
+    */
+
+    fdb_kvs_handle *handle;
+    struct filemgr *file;
+    struct docio_handle *dhandle;
+    err_log_callback *log_callback;
+    int rderrno;
+    void *buf;
+    uint64_t offset;
+    docio_cb_fn docio_cb1; // from where docio_* is called
+    docio_cb_fn docio_cb2; // inside docio.cc
+    struct _fdb_key_cmp_info *key_cmp_info;
+    void *args;
+    bool nested;
+
+    /*
+        fdb_get
+    */
+
+    fdb_doc *udoc;
+    struct docio_object *doc;
+    size_t keylen;
+    user_fdb_async_get_cb_fn user_cb;
+    user_fdb_async_get_cb_fn_nodoc user_cb_nodoc;
+    uint32_t doclen;
+
+    /*
+        hbtrie_find
+    */
+
+    void* keybuf;
+    struct docio_length *length;
+    uint32_t pos;
+    void *valuebuf;
+    docio_cb_fn hbtrie_find_cb;
+
+    /*
+        async btreeblock read
+    */
+
+    struct btree *btree;
+    struct btreeblk_handle *bhandle;
+    struct btreeblk_block *block;
+    uint8_t* addr;
+    void* key;
+    uint16_t klen;
+    void* value_buf;
+    docio_cb_fn btree_cb;
+    int btreeres;
+    struct btree_find_state_machine *btree_sm;
+
+    /*
+     * Latency tracking
+     */
+
+    uint64_t submission;
+    uint64_t btree_done;
+    uint64_t read_queued;
+    uint64_t taken_off_queue;
+    uint64_t cache_read;
+    uint64_t sent_to_kvssd;
+    uint64_t queued_in_kvssd;
+    uint64_t returned_from_kvssd;
+    uint64_t completion;
+
+    mutex_t lock;
+};
+
 struct docio_handle {
     struct filemgr *file;
     bid_t curblock;
@@ -37,17 +109,28 @@ struct docio_handle {
     bid_t lastbid;
     uint64_t lastBmpRevnum;
     void *readbuffer;
+    uint64_t last_read_size;
     err_log_callback *log_callback;
     bool compress_document_body;
 };
 
-#define DOCIO_NORMAL (0x00)
+// #define DOCIO_NORMAL (0x00)
 #define DOCIO_COMPACT (0x01)
 #define DOCIO_COMPRESSED (0x02)
 #define DOCIO_DELETED (0x04)
 #define DOCIO_TXN_DIRTY (0x08)
 #define DOCIO_TXN_COMMITTED (0x10)
 #define DOCIO_SYSTEM (0x20) /* system document */
+
+/*
+    ForestKV Modification
+    Since both doc and index writes are not block sized
+    anymore, we use this flag to distinguish between
+    a doc and index block. 0x30 instead of 0x00 so we
+    don't confuse zeroed out index blocks for doc blocks 
+*/
+
+#define DOCIO_NORMAL (0x40) 
 #ifdef DOCIO_LEN_STRUCT_ALIGN
     // this structure will occupy 16 bytes
     struct docio_length {
@@ -81,7 +164,7 @@ struct docio_handle {
 struct docio_object {
     docio_object()
         : timestamp(0), key(nullptr), seqnum(0)
-        , meta(nullptr), body(nullptr)
+        , meta(nullptr), body(nullptr), vernum(0)
         {}
     struct docio_length length;
     timestamp_t timestamp;
@@ -92,6 +175,7 @@ struct docio_object {
     };
     void *meta;
     void *body;
+    uint64_t vernum;
 };
 
 fdb_status docio_init(struct docio_handle *handle,
@@ -100,8 +184,10 @@ fdb_status docio_init(struct docio_handle *handle,
 void docio_free(struct docio_handle *handle);
 
 bid_t docio_append_doc_raw(struct docio_handle *handle,
-                           uint64_t size,
+                           void *key, keylen_t keylen,
+                           uint64_t vernum, uint64_t size,
                            void *buf);
+
 
 #define DOCIO_COMMIT_MARK_SIZE (sizeof(struct docio_length) + sizeof(uint64_t))
 bid_t docio_append_commit_mark(struct docio_handle *handle, uint64_t doc_offset);
@@ -135,6 +221,12 @@ fdb_status docio_read_doc_key(struct docio_handle *handle,
                               keylen_t *keylen,
                               void *keybuf);
 
+fdb_status docio_read_doc_key_async(struct docio_handle *handle,
+                                    uint64_t offset,
+                                    keylen_t *keylen,
+                                    void *keybuf,
+                                    struct async_read_ctx_t *args);
+
 /**
  * Read a key and its metadata at a given file offset.
  *
@@ -167,6 +259,28 @@ int64_t docio_read_doc(struct docio_handle *handle,
                        struct docio_object *doc,
                        bool read_on_cache_miss);
 
+/**
+ * Read a KV item at a given file offset.
+ *
+ * @param handle Pointer to the doc I/O handle
+ * @param offset File offset to a KV item
+ * @param doc Pointer to docio_object instance
+ * @param read_on_cache_miss Flag indicating if a disk read should be performed
+ *        on cache miss
+ * @return next offset right after a key and its value on succcessful read,
+ *         otherwise, the corresponding error code is returned.
+ */
+fdb_status docio_read_doc_async(struct docio_handle *handle,
+                                uint64_t offset,
+                                struct docio_object *doc,
+                                bool read_on_cache_miss,
+                                struct async_read_ctx_t *args);
+
+int64_t docio_read_hashed_doc(struct docio_handle *handle,
+                       uint64_t offset,
+                       struct docio_object *doc,
+                       bool read_on_cache_miss);
+
 size_t docio_batch_read_docs(struct docio_handle *handle,
                              uint64_t *offset_array,
                              struct docio_object *doc_array,
@@ -190,6 +304,21 @@ bool docio_check_buffer(struct docio_handle *handle,
                         bid_t bid,
                         uint64_t sb_bmp_revnum);
 
+/**
+ * Check if the given KV pair is a document or not. For now, checks if document size
+ * doesn't equal blocksize
+ *
+ * @param handle Pointer to DocIO handle.
+ * @param bid ID of the block.
+ * @param sb_bmp_revnum Revision number of bitmap in superblock. If the value is
+ *        -1, this function does not care about revision number.
+ * @return True if valid.
+ */
+bool docio_check_buffer_kvssd(struct docio_handle *handle, bid_t bid);
+bool docio_check_buffer_kvssd_direct(struct docio_handle *handle, void* buf, 
+                                     uint32_t len);
+int64_t docio_buf_to_doc(struct docio_handle *handle, uint64_t offset, 
+                         struct docio_object *doc, void* buf);
 
 INLINE void docio_reset(struct docio_handle *dhandle) {
     dhandle->curblock = BLK_NOT_FOUND;

@@ -360,9 +360,31 @@ typedef enum {
     FDB_RESULT_ALREADY_COMPACTED = -73,
 
     // Any new error codes can be added here.
+    
+    /**
+     * ForestKV doesn't delete stale keys when a snapshot is open
+     */
+    FDB_RESULT_ESNAPSHOTOPEN = -74,
+
+    FDB_RESULT_MISS = -75,
+
+    /**
+     * Iterator for a certain prefix may already be open in the KVSSD
+     */
+    FDB_RESULT_ITERATOR_OPEN = -76,
+
+    /**
+     *  Too many open iterators on the KVSSD
+     */
+    FDB_RESULT_ITERATOR_MAX = -77,
+
+    /*
+     * Delete of a non-existent KV pair.
+     */
+    FDB_RESULT_KEY_NOT_EXIST = -78,
 
     // Last (minimum) fdb_status value
-    FDB_RESULT_LAST = FDB_RESULT_ALREADY_COMPACTED
+    FDB_RESULT_LAST = FDB_RESULT_ITERATOR_MAX
 } fdb_status;
 
 #ifdef __cplusplus

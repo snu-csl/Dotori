@@ -7,9 +7,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "btree.h"
 #include "common.h"
+#include "docio.h"
+#include "btreeblock.h"
+#include "filemgr.h"
+#include "log_message.h"
+#include "kvssdmgr.h"
 
 #include "list.h"
 
@@ -34,11 +40,64 @@
     #define _metasize_align(size) (size)
 #endif
 
+uint32_t _get_bnode_write_len(void *value, uint32_t *nentry_out, bool encode)
+{
+    uint32_t nentry;
+    struct bnode* node;
+    uint32_t write_len = 0;
+    metasize_t meta_size = 0;
+
+    node = (struct bnode*)value;
+    if (encode)
+        nentry = _endian_decode(node->nentry);
+    else
+        nentry = node->nentry;
+
+    write_len += sizeof(struct bnode) +
+                (nentry * sizeof(uint64_t) * 2)
+                + 1;
+
+    if(_endian_decode(node->flag) & BNODE_MASK_METADATA) {
+        memcpy(&meta_size, (uint8_t*)node + sizeof(struct bnode), sizeof(metasize_t));
+        write_len += sizeof(metasize_t);
+        write_len += _metasize_align(_endian_decode(meta_size));
+    }
+
+    if(nentry_out) {
+        *nentry_out = nentry;
+    }
+
+    return write_len;
+}
+
+bool _in_snapshot(struct filemgr *file, uint64_t bid)
+{
+    file->open_snapshots_lock.lock();
+    for(auto snapshot: *file->open_snapshots) {
+        if(bid < snapshot) {
+            file->open_snapshots_lock.unlock();
+            return true;
+        }
+    }
+    file->open_snapshots_lock.unlock();
+    return false;
+}
+
+void print_btree_here(struct btree *btree, void *key, void *value, int depth)
+{
+    uint64_t offset;
+    memcpy(&offset, value, sizeof(uint64_t));
+    offset = _endian_decode(offset);
+
+    char char_key[9] = "0";
+    memcpy(char_key, key, 8);
+
+    fprintf(stderr, "(%s {%" _F64 ", %" _F64 "})", char_key, offset >> 32, offset & 0xFFFFFFFF);
+}
+
 INLINE int is_subblock(bid_t subbid)
 {
-    uint8_t flag;
-    flag = (subbid >> (8 * (sizeof(bid_t)-2))) & 0x00ff;
-    return flag;
+    return false;
 }
 
 INLINE struct bnode *_fetch_bnode(struct btree *btree, void *addr, uint16_t level)
@@ -58,6 +117,7 @@ INLINE struct bnode *_fetch_bnode(struct btree *btree, void *addr, uint16_t leve
         node->data = (uint8_t *)addr + sizeof(struct bnode) + sizeof(metasize_t) +
                      _metasize_align(metasize);
     }
+
     return node;
 }
 
@@ -85,6 +145,7 @@ INLINE int _bnode_size(
     int nodesize = 0;
 
     if (node->flag & BNODE_MASK_METADATA) {
+        assert(0);
         metasize_t size;
         memcpy(&size, (uint8_t *)node + sizeof(struct bnode), sizeof(metasize_t));
         size = _endian_decode(size);
@@ -188,7 +249,81 @@ INLINE int _bnode_size_check(
     }
 
     *size_out = cursize;
+
     return ( cursize <= nodesize );
+}
+
+void _copy_log(struct filemgr *file, uint64_t src, uint64_t dst, uint16_t level)
+{
+    while(atomic_get_uint8_t(&file->flushing) == 1) {
+        usleep(1);
+    }
+
+    mutex_lock(&file->entries_lock);
+    mutex_lock(&file->outstanding_log_lock);
+
+    if(level == 1) {
+        auto entries = file->entries_per_node->find(src);
+        assert(entries != file->entries_per_node->end());
+        file->entries_per_node->insert({dst, file->entries_per_node->find(src)->second});
+    }
+
+    auto log = file->outstanding_logs->find(src);
+    assert(log != file->outstanding_logs->end());
+    file->outstanding_logs->insert({dst, log->second}); 
+
+    mutex_unlock(&file->outstanding_log_lock);
+    mutex_unlock(&file->entries_lock);
+}
+
+void _log_index_write(struct filemgr *file, struct bnode* node,
+                      void *key, void *value, uint64_t bid, bool update) {
+    update = false;
+    uint64_t val;
+
+    /*
+     * We take a lock on the log lock here even though the global
+     * write lock is held because a reader may need to get the
+     * latest log when collecting a node.
+     */
+
+    mutex_lock(&file->outstanding_log_lock);
+    auto log = file->outstanding_logs->find(bid);
+    if(log == file->outstanding_logs->end()) {
+        file->outstanding_logs->insert({bid, std::string("")});
+        log = file->outstanding_logs->find(bid);
+        log->second.append("LEVEL___");
+        log->second.append((char*)&node->level, 8);
+    }
+    mutex_unlock(&file->outstanding_log_lock);
+
+    mutex_lock(&file->entries_lock);
+    if(node->level == 1 && !update) {
+        val = *(uint64_t*)value;
+        auto entries = file->entries_per_node->find(bid);
+        if(entries == file->entries_per_node->end()) {
+            assert(val != BLK_NOT_FOUND);
+            file->entries_per_node->insert({bid, 1});
+            entries = file->entries_per_node->find(bid);
+        } else {
+            if(val == BLK_NOT_FOUND) {
+                entries->second--;
+            } else {
+                entries->second++;
+            }
+        }
+    }
+    mutex_unlock(&file->entries_lock);
+
+    log->second.append((char*)key, 8);
+    log->second.append((char*)value, 8);
+
+    assert(!strncmp("LEVEL___", log->second.c_str(), 8));
+
+    std::string tmp = std::string((char*)key, 8);
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "Adding KV %s %lu to the logs for node %lu.",
+            tmp.c_str(), *(uint64_t*) value, node->bid);
 }
 
 INLINE struct bnode * _btree_init_node(
@@ -205,6 +340,8 @@ INLINE struct bnode * _btree_init_node(
     node->nentry = 0;
     node->level = level;
     node->flag = flag;
+    node->bid = bid;
+    node->append = true;
 
     if ((flag & BNODE_MASK_METADATA) && meta) {
         _size = _endian_encode(meta->size);
@@ -275,10 +412,12 @@ void btree_update_meta(struct btree *btree, struct btree_meta *meta)
     metasize_t metasize, _metasize;
     metasize_t old_metasize = (metasize_t)(-1);
     struct bnode *node;
+    struct filemgr *file;
 
     // read root node
     addr = btree->blk_ops->blk_read(btree->blk_handle, btree->root_bid);
     node = _fetch_bnode(btree, addr, btree->height);
+    file = ((struct btreeblk_handle*) btree->blk_handle)->file;
 
     ptr = ((uint8_t *)node) + sizeof(struct bnode);
 
@@ -307,32 +446,50 @@ void btree_update_meta(struct btree *btree, struct btree_meta *meta)
         // move kv-pairs (only if meta size is changed)
         if (_metasize_align(metasize) < _metasize_align(old_metasize)){
             memmove(
-                (uint8_t *)ptr + sizeof(metasize_t) + _metasize_align(metasize),
-                node->data,
-                btree->kv_ops->get_data_size(node, NULL, NULL, NULL, 0));
+                    (uint8_t *)ptr + sizeof(metasize_t) + _metasize_align(metasize),
+                    node->data,
+                    btree->kv_ops->get_data_size(node, NULL, NULL, NULL, 0));
             node->data = (uint8_t *)node->data - (_metasize_align(old_metasize) -
-                         _metasize_align(metasize));
+                                                  _metasize_align(metasize));
         }
 
     }else {
         if (node->flag & BNODE_MASK_METADATA) {
             // existing metadata is removed
             memmove(ptr, node->data, btree->kv_ops->get_data_size(node,
-                                                    NULL, NULL, NULL, 0));
+                                                                  NULL, NULL, NULL, 0));
             node->data = (uint8_t *)node->data - (_metasize_align(old_metasize) +
-                         sizeof(metasize_t));
+                                                  sizeof(metasize_t));
             // clear the flag
             node->flag &= ~BNODE_MASK_METADATA;
         }
     }
 
-    if (!btree->blk_ops->blk_is_writable(btree->blk_handle, btree->root_bid)) {
+    if (!btree->blk_ops->blk_is_writable(btree->blk_handle, btree->root_bid) &&
+            _in_snapshot(file, btree->root_bid)) {
         // already flushed block -> cannot overwrite, we have to move to new block
         btree->blk_ops->blk_move(btree->blk_handle, btree->root_bid,
-                                &btree->root_bid);
+                                 &btree->root_bid);
     }else{
         btree->blk_ops->blk_set_dirty(btree->blk_handle, btree->root_bid);
     }
+}
+
+/* START btree_init_from_bid_async */
+void btree_init_from_bid_async_complete(struct async_read_ctx_t *ctx)
+{
+    struct bnode *root;
+    struct btree *btree;
+    void *addr;
+
+    addr = ctx->addr;
+    btree = ctx->btree;
+    root = _fetch_bnode(btree, addr, 0);
+
+    btree->root_flag = root->flag;
+    btree->height = root->level;
+    _get_kvsize(root->kvsize, btree->ksize, btree->vsize);
+    ctx->hbtrie_find_cb(ctx);
 }
 
 btree_result btree_init_from_bid(struct btree *btree, void *blk_handle,
@@ -376,6 +533,10 @@ btree_result btree_init(
     btree->blksize = nodesize;
     btree->ksize = ksize;
     btree->vsize = vsize;
+
+    ((struct btreeblk_handle * )btree->blk_handle)->file->config->bnode_ksize = ksize;
+    ((struct btreeblk_handle * )btree->blk_handle)->file->config->bnode_vsize = vsize;
+
     if (meta) {
         btree->root_flag |= BNODE_MASK_METADATA;
         min_nodesize = sizeof(struct bnode) + _metasize_align(meta->size) +
@@ -424,7 +585,7 @@ return: 1 (index# of the key '4')
 */
 static idx_t _btree_find_entry(struct btree *btree, struct bnode *node, void *key)
 {
-    idx_t start, end, middle, temp;
+    idx_t start, end, middle;
     uint8_t *k = alca(uint8_t, btree->ksize);
     int cmp;
     #ifdef __BIT_CMP
@@ -483,11 +644,12 @@ static idx_t _btree_find_entry(struct btree *btree, struct bnode *node, void *ke
     return BTREE_IDX_NOT_FOUND;
 }
 
-static idx_t _btree_add_entry(struct btree *btree, struct bnode *node, void *key, void *value)
+static idx_t _btree_add_entry(struct btree *btree, struct bnode *node, void *key, void *value, bool logging)
 {
     idx_t idx, idx_insert;
     uint8_t *k = alca(uint8_t, btree->ksize);
-
+    struct filemgr * file = ((struct btreeblk_handle*)btree->blk_handle)->file;
+    
     if (btree->kv_ops->init_kv_var) btree->kv_ops->init_kv_var(btree, k, NULL);
 
     if (node->nentry > 0) {
@@ -500,6 +662,8 @@ static idx_t _btree_add_entry(struct btree *btree, struct bnode *node, void *key
                 // if same key already exists -> update its value
                 btree->kv_ops->set_kv(node, idx, key, value);
                 if (btree->kv_ops->free_kv_var) btree->kv_ops->free_kv_var(btree, k, NULL);
+
+                _log_index_write(file, node, key, value, node->bid, true);
                 return idx;
             }else{
                 idx_insert = idx+1;
@@ -519,7 +683,6 @@ static idx_t _btree_add_entry(struct btree *btree, struct bnode *node, void *key
         }else{
             btree->kv_ops->set_kv(node, idx_insert, key, value);
         }
-
     }else{
         idx_insert = 0;
         // add at idx_insert
@@ -528,6 +691,7 @@ static idx_t _btree_add_entry(struct btree *btree, struct bnode *node, void *key
 
     // add at idx_insert
     node->nentry++;
+    _log_index_write(file, node, key, value, node->bid, false);
 
     if (btree->kv_ops->free_kv_var) btree->kv_ops->free_kv_var(btree, k, NULL);
     return idx_insert;
@@ -575,15 +739,17 @@ static void _btree_print_node(struct btree *btree, int depth,
     addr = btree->blk_ops->blk_read(btree->blk_handle, bid);
     node = _fetch_bnode(btree, addr, depth);
 
-    fprintf(stderr, "[d:%d n:%d f:%x b:%" _F64 " ", node->level, node->nentry, node->flag, bid);
+    fprintf(stderr, "[d:%d n:%d f:%x b:{%" _F64 ", %" _F64 "} -> ", node->level, node->nentry, node->flag, node->bid >> 32, node->bid & 0xFFFFFFFF);
 
     for (i=0;i<node->nentry;++i){
-        btree->kv_ops->get_kv(node, i, k, v);
-        _bid = btree->kv_ops->value2bid(v);
-        _bid = _endian_decode(_bid);
-        func(btree, k, (void*)&_bid);
+            btree->kv_ops->get_kv(node, i, k, v);
+            _bid = btree->kv_ops->value2bid(v);
+            if (depth > 1)
+                _bid = _endian_decode(_bid);
+            func(btree, k, (void *) &_bid, depth);
     }
     fprintf(stderr, "]\n");
+
     if (depth > 1) {
         for (i=0;i<node->nentry;++i){
             btree->kv_ops->get_kv(node, i, k, v);
@@ -681,9 +847,21 @@ btree_result btree_find(struct btree *btree, void *key, void *value_buf)
     // set root
     bid[btree->height-1] = btree->root_bid;
 
+    //std::string tmp = std::string((char*)key, 8);
+    //printf("searching for %s root %lu\n", tmp.c_str(), btree->root_bid);
+    fflush(stdout);
+
     for (i=btree->height-1; i>=0; --i) {
         // read block using bid
         addr = btree->blk_ops->blk_read(btree->blk_handle, bid[i]);
+
+        if(!addr) {
+            return BTREE_RESULT_FAIL;
+        }
+
+        //printf("read bid %lu\n", bid[i]);
+        //fflush(stdout);
+
         // fetch node structure from block
         node[i] = _fetch_bnode(btree, addr, i+1);
 
@@ -710,7 +888,7 @@ btree_result btree_find(struct btree *btree, void *key, void *value_buf)
             // return (address of) value if KEY == k
             if (!btree->kv_ops->cmp(key, k, btree->aux)) {
                 btree->kv_ops->set_value(btree, value_buf, v);
-            }else{
+            } else {
                 if (btree->blk_ops->blk_operation_end)
                     btree->blk_ops->blk_operation_end(btree->blk_handle);
                 if (btree->kv_ops->free_kv_var) {
@@ -728,9 +906,9 @@ btree_result btree_find(struct btree *btree, void *key, void *value_buf)
 }
 
 static int _btree_split_node(
-    struct btree *btree, void *key, struct bnode **node, bid_t *bid, idx_t *idx, int i,
-    struct list *kv_ins_list, size_t nsplitnode, void *k, void *v,
-    int8_t *modified, int8_t *minkey_replace, int8_t *ins)
+        struct btree *btree, void *key, struct bnode **node, bid_t *bid, idx_t *idx, int i,
+        struct list *kv_ins_list, size_t nsplitnode, void *k, void *v,
+        int8_t *modified, int8_t *minkey_replace, int8_t *ins)
 {
     void *addr;
     size_t nnode = nsplitnode;
@@ -748,6 +926,7 @@ static int _btree_split_node(
     struct bnode **new_node = alca(struct bnode *, nnode);
     memset(new_node, 0, nnode * sizeof(struct bnode*));
     struct kv_ins_item *kv_item = NULL;
+    struct filemgr * file = ((struct btreeblk_handle*)btree->blk_handle)->file;
 
     // allocate new block(s)
     new_node[0] = node[i];
@@ -755,7 +934,15 @@ static int _btree_split_node(
         addr = btree->blk_ops->blk_alloc(btree->blk_handle, &new_bid[j]);
         new_node[j] = _btree_init_node(btree, new_bid[j], addr, 0x0,
                                        node[i]->level, NULL);
+
+        if(node[i]->level == 1) {
+            atomic_add_uint64_t(&file->logs_occupied_space, 
+                    file->config->max_logs_per_node * (LOG_RETRIEVE_LENGTH / 2));
+        }
     }
+
+    fdb_log(NULL, FDB_LOG_DEBUG, FDB_RESULT_SUCCESS,
+            "Splitting %lu to %lu\n", node[i]->bid, new_node[1]->bid);
 
     // calculate # entry
     for (j=0;j<nnode+1;++j){
@@ -769,6 +956,28 @@ static int _btree_split_node(
     for (j=1;j<nnode;++j){
         btree->kv_ops->copy_kv(new_node[j], node[i], 0, split_idx[j],
                                nentry[j]);
+
+        void *tmp_key = malloc(8);
+        void *tmp_val = malloc(8);
+        uint64_t tmp_block = BLK_NOT_FOUND;
+        for(int k = split_idx[j]; k < split_idx[j] + nentry[j]; k++) {
+            btree->kv_ops->get_kv(node[i], k, tmp_key, tmp_val);
+            _log_index_write(file, new_node[j],
+                    tmp_key, tmp_val,
+                    new_node[j]->bid, false);
+            _log_index_write(file, node[i],
+                    tmp_key, &tmp_block,
+                    node[i]->bid, false);
+
+            std::string tmp = std::string((char*)tmp_key, 8);
+            fdb_log(NULL, FDB_LOG_DEBUG,
+                    FDB_RESULT_READ_FAIL,
+                    "%s %lu moved to %lu from %lu in split level %u idx %u root %lu\n", 
+                    tmp.c_str(), *(uint64_t*)tmp_val, new_node[j]->bid, node[i]->bid,
+                    node[i]->level, k, btree->root_bid);
+        }
+        free(tmp_key);
+        free(tmp_val);
     }
     j = 0;
     btree->kv_ops->copy_kv(new_node[j], node[i], 0, split_idx[j], nentry[j]);
@@ -790,16 +999,16 @@ static int _btree_split_node(
                 btree->kv_ops->get_kv(new_node[j], 0, k, v);
                 if (btree->kv_ops->cmp(kv_item->key, k, btree->aux) < 0) {
                     idx_ins[i] =
-                        _btree_add_entry(btree, new_node[j-1], kv_item->key,
-                                         kv_item->value);
+                            _btree_add_entry(btree, new_node[j-1], kv_item->key,
+                                             kv_item->value, false);
                     break;
                 }
             }
             if (idx_ins[i] == BTREE_IDX_NOT_FOUND) {
                 // insert into the last split node
                 idx_ins[i] =
-                    _btree_add_entry(btree, new_node[nnode-1], kv_item->key,
-                                     kv_item->value);
+                        _btree_add_entry(btree, new_node[nnode-1], kv_item->key,
+                                         kv_item->value, false);
             }
             e = list_next(e);
         }
@@ -839,16 +1048,22 @@ static int _btree_split_node(
         btree->height++;
 
         addr = btree->blk_ops->blk_alloc(btree->blk_handle, &new_root_bid);
+
+        if(node[i]->level == 1) {
+            atomic_add_uint64_t(&file->logs_occupied_space, 
+                    file->config->max_logs_per_node * (LOG_RETRIEVE_LENGTH / 2));
+        }
+
         if (meta.size > 0)
             new_root =
-                _btree_init_node(
-                    btree, new_root_bid, addr, btree->root_flag,
-                    node[i]->level + 1, &meta);
+                    _btree_init_node(
+                            btree, new_root_bid, addr, btree->root_flag,
+                            node[i]->level + 1, &meta);
         else
             new_root =
-                _btree_init_node(
-                    btree, new_root_bid, addr, btree->root_flag,
-                    node[i]->level + 1, NULL);
+                    _btree_init_node(
+                            btree, new_root_bid, addr, btree->root_flag,
+                            node[i]->level + 1, NULL);
 
         // clear old root node flag
         node[i]->flag &= ~BNODE_MASK_ROOT;
@@ -856,9 +1071,22 @@ static int _btree_split_node(
         // change root bid
         btree->root_bid = new_root_bid;
 
+        uint64_t tmp_block = BLK_NOT_FOUND;
         // move the former node if not dirty
-        if (!btree->blk_ops->blk_is_writable(btree->blk_handle, bid[i])) {
+        if (0 && !btree->blk_ops->blk_is_writable(btree->blk_handle, bid[i])) {
+            uint64_t old_bid = bid[i];
             addr = btree->blk_ops->blk_move(btree->blk_handle, bid[i], &bid[i]);
+
+            void *tmp_key = malloc(8);
+            void *tmp_val = malloc(8);
+            for(int k = 0; k < node[i]->nentry; k++) {
+                btree->kv_ops->get_kv(node[i], k, tmp_key, tmp_val);
+                _log_index_write(file, node[i], tmp_key, tmp_val, bid[i], false);
+                _log_index_write(file, node[i], tmp_key, &tmp_block, old_bid, false);
+            }
+            free(tmp_key);
+            free(tmp_val);
+
             node[i] = _fetch_bnode(btree, addr, i+1);
         }else{
             btree->blk_ops->blk_set_dirty(btree->blk_handle, bid[i]);
@@ -868,15 +1096,14 @@ static int _btree_split_node(
         // original (i.e. the first node)
         btree->kv_ops->get_kv(node[i], 0, k, v);
         _bid = _endian_encode(bid[i]);
-        _btree_add_entry(btree, new_root, k, btree->kv_ops->bid2value(&_bid));
+        _btree_add_entry(btree, new_root, k, btree->kv_ops->bid2value(&_bid), false);
 
         // the others
         for (j=1;j<nnode;++j){
-            //btree->kv_ops->get_kv(new_node[j], 0, k, v);
             btree->kv_ops->get_nth_splitter(new_node[j-1], new_node[j], k);
             _bid = _endian_encode(new_bid[j]);
             _btree_add_entry(btree, new_root, k,
-                             btree->kv_ops->bid2value(&_bid));
+                             btree->kv_ops->bid2value(&_bid), false);
         }
 
         return 1;
@@ -906,7 +1133,7 @@ static int _btree_move_modified_node(
     return 0;
 }
 
-btree_result btree_insert(struct btree *btree, void *key, void *value)
+btree_result btree_insert_get_old(struct btree *btree, void *key, void *value, void* oldvalue_out)
 {
     void *addr;
     size_t nsplitnode = 1;
@@ -932,6 +1159,10 @@ btree_result btree_insert(struct btree *btree, void *key, void *value)
     idx_t *idx_ins = alca(idx_t, btree->height);
     struct bnode **node = alca(struct bnode *, btree->height);
     int i, j, _is_update = 0;
+    uint64_t old_offset = _endian_encode(BLK_NOT_FOUND);
+
+    auto bhandle = (struct btreeblk_handle*)btree->blk_handle;
+    struct filemgr * file = bhandle->file;
 
     // initialize flags
     for (i=0;i<btree->height;++i) {
@@ -958,13 +1189,57 @@ btree_result btree_insert(struct btree *btree, void *key, void *value)
 
     // find path from root to leaf
     for (i=btree->height-1; i>=0; --i){
-        // read block using bid
-        addr = btree->blk_ops->blk_read(btree->blk_handle, bid[i]);
-        // fetch node structure from block
-        node[i] = _fetch_bnode(btree, addr, i+1);
+        if(i > 0) {
+            // read block using bid
+            addr = btree->blk_ops->blk_read(btree->blk_handle, bid[i]);
+            // fetch node structure from block
+            node[i] = _fetch_bnode(btree, addr, i+1);
 
-        // lookup key in current node
-        idx[i] = _btree_find_entry(btree, node[i], key);
+            // lookup key in current node
+            idx[i] = _btree_find_entry(btree, node[i], key);
+        } else {
+            file->this_flush_leaves_updated->insert(bid[i]);
+            addr = btree->blk_ops->blk_read_leaf(btree->blk_handle, bid[i]);
+
+            mutex_lock(&file->entries_lock);
+            auto entries = file->entries_per_node->find(bid[i]);
+            if(addr != NULL) {
+                node[i] = _fetch_bnode(btree, addr, i+1);
+                idx[i] = _btree_find_entry(btree, node[i], key);
+
+                /*
+                 * There will be no entries for this node if
+                 * it is the only node in the tree (height == 1)
+                 * and hasn't received any inserts yet
+                 */
+
+                if(entries != file->entries_per_node->end()) {
+                    entries->second = node[i]->nentry;
+                } else {
+                    assert(btree->height == 1);
+                }
+            } else {
+                
+                /*
+                 * After restarting Dotori, we do a full node read 
+                 * for the first read of each node because we need to
+                 * know how many outstanding logs it has
+                 */
+
+                if(entries == file->entries_per_node->end()) {
+                    mutex_unlock(&file->entries_lock);
+                    addr = btree->blk_ops->blk_read(btree->blk_handle, bid[i]);
+                    mutex_lock(&file->entries_lock);
+                    assert(addr);
+                    node[i] = _fetch_bnode(btree, addr, i+1);
+                    idx[i] = _btree_find_entry(btree, node[i], key);
+                    file->entries_per_node->insert({node[i]->bid, node[i]->nentry});
+                } else {
+                    node[i] = NULL;
+                }
+            }
+            mutex_unlock(&file->entries_lock);
+        }
 
         if (i > 0) {
             // index (non-leaf) node
@@ -982,8 +1257,41 @@ btree_result btree_insert(struct btree *btree, void *key, void *value)
         }
     }
 
+insert_loop_begin:
     // cascaded insert from leaf to root
     for (i=0;i<btree->height;++i){
+        if(i == 0 && node[i] == NULL) {
+            struct bnode tmp_node;
+            tmp_node.level = 1;
+            tmp_node.bid = BLK_NOT_FOUND;
+
+            mutex_lock(&file->entries_lock);
+            auto entries = file->entries_per_node->find(bid[i]);
+            if(entries != file->entries_per_node->end()) {
+                uint32_t tmp;
+
+                tmp = (entries->second + 1) * 16;
+                tmp += sizeof(struct bnode);
+
+                uint8_t _size_check = tmp <= btree->blk_ops->blk_get_size(btree->blk_handle, 
+                        bid[i]) - 1;
+
+                if(!_size_check) {
+                    file->this_flush_leaf_split_reads++;
+                    mutex_unlock(&file->entries_lock);
+                    addr = btree->blk_ops->blk_read(btree->blk_handle, bid[i]);
+                    assert(addr);
+                    node[i] = _fetch_bnode(btree, addr, i+1);
+                    idx[i] = _btree_find_entry(btree, node[i], key);
+                    entries->second = node[i]->nentry;
+                    goto insert_loop_begin;
+                }
+            } 
+
+            mutex_unlock(&file->entries_lock);
+            _log_index_write(file, &tmp_node, key, value, bid[i], true);
+			continue;
+		} 
 
         if (idx[i] != BTREE_IDX_NOT_FOUND)
             btree->kv_ops->get_kv(node[i], idx[i], k, NULL);
@@ -1002,6 +1310,7 @@ btree_result btree_insert(struct btree *btree, void *key, void *value)
                 _bid = _endian_encode(bid[i-1]);
                 btree->kv_ops->set_kv(node[i], idx[i], k,
                                       btree->kv_ops->bid2value(&_bid));
+                _log_index_write(file, node[i], k, btree->kv_ops->bid2value(&_bid), node[i]->bid, true);
                 modified[i] = 1;
             }
         }
@@ -1019,14 +1328,22 @@ btree_result btree_insert(struct btree *btree, void *key, void *value)
                 e = list_begin(&kv_ins_list[i]);
                 kv_item = _get_entry(e, struct kv_ins_item, le);
                 _is_update =
-                    (idx[i] != BTREE_IDX_NOT_FOUND &&
-                     !btree->kv_ops->cmp(kv_item->key, k, btree->aux));
+                        (idx[i] != BTREE_IDX_NOT_FOUND &&
+                         !btree->kv_ops->cmp(kv_item->key, k, btree->aux));
             }
 
-        check_node:;
-            int _size_check =
-                _bnode_size_check(btree, bid[i], node[i], new_minkey,
-                                  &kv_ins_list[i], &nodesize);
+            if(_is_update) {
+                btree->kv_ops->get_kv(node[i], idx[i], k, &old_offset);
+            }
+
+check_node:;
+           int _size_check;
+           if(i > 0 || node[i] != NULL) {
+               _size_check = _bnode_size_check(btree, bid[i], node[i], new_minkey,
+                       &kv_ins_list[i], &nodesize);
+           } else {
+               assert(0);
+           }
 
             if (_size_check || _is_update ) {
                 //2 enough space
@@ -1037,7 +1354,7 @@ btree_result btree_insert(struct btree *btree, void *key, void *value)
                     while(e) {
                         kv_item = _get_entry(e, struct kv_ins_item, le);
                         idx_ins[i] = _btree_add_entry(btree, node[i],
-                                                 kv_item->key, kv_item->value);
+                                kv_item->key, kv_item->value, true);
                         e = list_next(e);
                     }
                 }
@@ -1045,6 +1362,10 @@ btree_result btree_insert(struct btree *btree, void *key, void *value)
                     // replace the minimum key in the node to KEY
                     btree->kv_ops->get_kv(node[i], idx[i], k, v);
                     btree->kv_ops->set_kv(node[i], idx[i], key, v);
+
+                    uint64_t tmp_block = BLK_NOT_FOUND;
+                    _log_index_write(file, node[i], key, v, node[i]->bid, true);
+                    _log_index_write(file, node[i], k, &tmp_block, node[i]->bid, true);
                 }
                 modified[i] = 1;
 
@@ -1055,7 +1376,7 @@ btree_result btree_insert(struct btree *btree, void *key, void *value)
                     is_subblock(bid[i])) {
                     bid_t new_bid;
                     addr = btree->blk_ops->blk_enlarge_node(btree->blk_handle,
-                        bid[i], nodesize, &new_bid);
+                                                            bid[i], nodesize, &new_bid);
                     if (addr) {
                         // the node can be enlarged .. fetch the enlarged node
                         moved[i] = 1;
@@ -1078,24 +1399,29 @@ btree_result btree_insert(struct btree *btree, void *key, void *value)
                 if (nsplitnode == 1) nsplitnode = 2;
 
                 height_growup = _btree_split_node(
-                    btree, key, node, bid, idx, i,
-                    kv_ins_list, nsplitnode, k, v,
-                    modified, minkey_replace, ins);
+                        btree, key, node, bid, idx, i,
+                        kv_ins_list, nsplitnode, k, v,
+                        modified, minkey_replace, ins);
             } // split
         } // insert
 
         if (height_growup) break;
 
         if (modified[i]) {
-            //2 when the node is modified
-            if (!btree->blk_ops->blk_is_writable(btree->blk_handle, bid[i])) {
+            if (_in_snapshot(file, bid[i]) && 
+                (!btree->blk_ops->blk_is_writable(btree->blk_handle, bid[i]))) {
+
+                uint64_t old_bid = node[i]->bid;
+
+                assert(node[i]);
                 // not writable .. already flushed block -> cannot overwrite,
                 // we have to move to new block
                 height_growup = _btree_move_modified_node(
-                    btree, key, node, bid, idx, i,
-                    kv_ins_list, k, v,
-                    modified, minkey_replace, ins, moved);
+                        btree, key, node, bid, idx, i,
+                        kv_ins_list, k, v,
+                        modified, minkey_replace, ins, moved);
 
+                _copy_log(file, old_bid, bid[i], node[i]->level);
                 if (height_growup) break;
             }else{
                 // writable .. just set dirty to write back into storage
@@ -1123,6 +1449,8 @@ btree_result btree_insert(struct btree *btree, void *key, void *value)
         }
     }
 
+    memcpy(oldvalue_out, &old_offset, btree->vsize);
+
     if (_is_update) {
         return BTREE_RESULT_UPDATE;
     }else{
@@ -1149,6 +1477,9 @@ btree_result btree_remove(struct btree *btree, void *key)
     idx_t *idx_rmv = alca(idx_t, btree->height);
     struct bnode **node = alca(struct bnode *, btree->height);
     int i;
+
+    auto bhandle = (struct btreeblk_handle*)btree->blk_handle;
+    struct filemgr * file = bhandle->file;
 
     // initialize flags
     for (i=0;i<btree->height;++i) {
@@ -1305,7 +1636,8 @@ btree_result btree_remove(struct btree *btree, void *key)
 
         if (modified[i]) {
             // when node is modified
-            if (!btree->blk_ops->blk_is_writable(btree->blk_handle, bid[i])) {
+            if (_in_snapshot(file, bid[i]) && 
+                !btree->blk_ops->blk_is_writable(btree->blk_handle, bid[i])) {
                 // already flushed block -> cannot overwrite, so
                 // we have to move to new block
                 // get new bid[i]

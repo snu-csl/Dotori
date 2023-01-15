@@ -42,7 +42,7 @@
     //#define __CHECKSUM_ADLER32
 #endif
 
-#define __BIT_CMP
+//#define __BIT_CMP
 
 #define __ENDIAN_SAFE
 
@@ -74,7 +74,7 @@
 #define FDB_COMP_PROB_UNIT_DEC (5) // 5% (probability delta unit for decrease)
 
 // full compaction internval in secs when the circular block reusing is enabled
-#define FDB_COMPACTOR_SLEEP_DURATION (28800)
+#define FDB_COMPACTOR_SLEEP_DURATION (1000)
 #define FDB_DEFAULT_COMPACTION_THRESHOLD (30)
 
 #define FDB_BGFLUSHER_SLEEP_DURATION (2)
@@ -88,6 +88,14 @@
 #define BCACHE_EVICT_UNIT (1)
 #define BCACHE_MEMORY_THRESHOLD (0.8) // 80% of physical RAM
 #define __BCACHE_SECOND_CHANCE
+
+#define KVCACHE_NBUCKET (4099) // a prime number
+//#define BCACHE_NBUCKET (31) // a prime number
+#define KVCACHE_NDICBUCKET (4099) // a prime number
+#define KVCACHE_FLUSH_UNIT (1048576) // 1MB
+#define KVCACHE_EVICT_UNIT (1)
+#define KVCACHE_MEMORY_THRESHOLD (0.8) // 80% of physical RAM
+#define __KVCACHE_SECOND_CHANCE
 
 #define FILEMGR_PREFETCH_UNIT (4194304) // 4MB
 #define FILEMGR_RESIDENT_THRESHOLD (0.9) // 90 % of file is in buffer cache
@@ -108,7 +116,7 @@
 #define __BTREEBLK_BLOCKPOOL
 //#define __BTREEBLK_SUBBLOCK
 //#define __BTREEBLK_READ_TREE // not used now, for future use
-#define BTREEBLK_AGE_LIMIT (8)
+#define BTREEBLK_AGE_LIMIT (1)
 #define BTREEBLK_MIN_SUBBLOCK (128)
 //#define __BTREEBLK_CACHE
 #ifdef __BTREEBLK_CACHE
@@ -134,9 +142,12 @@
 #define ASYNC_IO_QUEUE_DEPTH (64)
 
 // Number of daemon compactor threads
-#define DEFAULT_NUM_COMPACTOR_THREADS (4)
+
+#define DEFAULT_NUM_COMPACTOR_THREADS (0)
 #define MAX_NUM_COMPACTOR_THREADS (128)
 
 #define DEFAULT_NUM_BGFLUSHER_THREADS (2)
 #define MAX_NUM_BGFLUSHER_THREADS (64)
+#define DEFAULT_NUM_WAL_PRELOADER_THREADS (1)
+#define MAX_NUM_WAL_PRELOADER_THREADS (64)
 #endif

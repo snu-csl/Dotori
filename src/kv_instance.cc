@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "libforestdb/forestdb.h"
+#include "bgflusher.h"
 #include "common.h"
 #include "internal_types.h"
 #include "fdb_internal.h"
@@ -31,7 +32,6 @@
 #include "hbtrie.h"
 #include "btreeblock.h"
 #include "version.h"
-#include "staleblock.h"
 
 #include "memleak.h"
 #include "timing.h"
@@ -143,6 +143,15 @@ void fdb_file_handle_close_all(fdb_file_handle *fhandle)
 {
     struct list_elem *e;
     struct kvs_opened_node *node;
+
+    // /*
+    //     If fdb_close is called without fdb_kvs_close
+    //     then the handles can still be active.
+    // */
+
+    // if(!(fhandle->root->config.flags & FDB_OPEN_FLAG_RDONLY)) {
+    //     bgflusher_deregister_kv_handle("default");
+    // }
 
     spin_lock(&fhandle->lock);
     e = list_begin(fhandle->handles);
@@ -1166,6 +1175,12 @@ uint64_t fdb_kvs_header_append(fdb_kvs_handle *handle)
     doc.length.metalen = 0;
     doc.length.bodylen = len;
     doc.seqnum = 0;
+    
+    if(file->config->kvssd) {
+        doc.vernum = filemgr_assign_new_vernum(handle->file);
+        atomic_incr_uint64_t(&file->pos);
+    }
+
     kv_info_offset = docio_append_doc_system(dhandle, &doc);
     free(data);
 
@@ -1173,7 +1188,8 @@ uint64_t fdb_kvs_header_append(fdb_kvs_handle *handle)
         if (docio_read_doc_length(handle->dhandle, &doc_len, prev_offset)
             == FDB_RESULT_SUCCESS) {
             // mark stale
-            filemgr_mark_stale(handle->file, prev_offset, _fdb_get_docsize(doc_len));
+            size_t size = _fdb_get_docsize(doc_len);
+            filemgr_mark_stale(handle->file, prev_offset, size);
         }
     }
 
@@ -1512,7 +1528,6 @@ fdb_kvs_create_start:
                                 cur_bmp_revnum,
                                 !(root_handle->config.durability_opt & FDB_DRB_ASYNC),
                                 &root_handle->log_callback);
-        btreeblk_reset_subblock_info(root_handle->bhandle);
     }
 
     filemgr_mutex_unlock(file);
@@ -1681,6 +1696,156 @@ fdb_status _fdb_kvs_open(fdb_kvs_handle *root_handle,
     return fs;
 }
 
+fdb_status _create_wal_preload_handle(fdb_kvs_handle **ptr_handle,
+                                      const char *filename,
+                                      fdb_config *fconfig,
+                                      const char *kvs_name,
+                                      fdb_kvs_config *kvs_config)
+{
+    fdb_file_handle *fhandle;
+    fdb_kvs_handle *handle;
+    fdb_config config;
+    fdb_status fs;
+    fdb_kvs_handle *root_handle;
+    fdb_kvs_config config_local;
+    struct filemgr *file = NULL;
+    struct filemgr *latest_file = NULL;
+    LATENCY_STAT_START();
+
+    fs = fdb_open(&fhandle, filename, fconfig);
+
+    if (!fhandle || !fhandle->root) {
+        return FDB_RESULT_INVALID_HANDLE;
+    }
+
+    root_handle = fhandle->root;
+    config = root_handle->config;
+
+    if (kvs_config) {
+        if (validate_fdb_kvs_config(kvs_config)) {
+            config_local = *kvs_config;
+        } else {
+            return FDB_RESULT_INVALID_CONFIG;
+        }
+    } else {
+        config_local = get_default_kvs_config();
+    }
+
+    fdb_check_file_reopen(root_handle, NULL);
+    fdb_sync_db_header(root_handle);
+
+    file = root_handle->file;
+    latest_file = root_handle->file;
+
+    if (kvs_name == NULL || !strcmp(kvs_name, default_kvs_name)) {
+        // return the default KV store handle
+        spin_lock(&fhandle->lock);
+        if (!(fhandle->flags & FHANDLE_ROOT_OPENED)) {
+            // the root handle is not opened yet
+            // sync up the root handle
+            fdb_custom_cmp_variable default_kvs_cmp = NULL;
+            void* default_kvs_cmp_param = NULL;
+
+            root_handle->kvs_config = config_local;
+
+            if (root_handle->file->kv_header) {
+                struct kvs_header* kvsh = root_handle->file->kv_header;
+
+                // search fhandle's custom cmp func list first
+                fdb_kvs_find_cmp_name(root_handle,
+                                      (char *)kvs_name,
+                                      &default_kvs_cmp,
+                                      &default_kvs_cmp_param);
+
+                spin_lock(&kvsh->lock);
+                kvsh->default_kvs_cmp = default_kvs_cmp;
+                kvsh->default_kvs_cmp_param = default_kvs_cmp_param;
+
+                if ( kvsh->default_kvs_cmp == NULL &&
+                     root_handle->kvs_config.custom_cmp ) {
+                    // follow kvs_config's custom cmp next
+                    kvsh->default_kvs_cmp = root_handle->kvs_config.custom_cmp;
+                    kvsh->default_kvs_cmp_param = root_handle->kvs_config.custom_cmp_param;
+                    fdb_file_handle_add_cmp_func(fhandle,
+                                                 NULL,
+                                                 root_handle->kvs_config.custom_cmp,
+                                                 root_handle->kvs_config.custom_cmp_param);
+                }
+
+                if (kvsh->default_kvs_cmp) {
+                    kvsh->custom_cmp_enabled = 1;
+                    fhandle->flags |= FHANDLE_ROOT_CUSTOM_CMP;
+                }
+                spin_unlock(&root_handle->file->kv_header->lock);
+            }
+
+            fhandle->flags |= FHANDLE_ROOT_INITIALIZED;
+            fhandle->flags |= FHANDLE_ROOT_OPENED;
+        }
+        // the root handle is already synced
+        // open new default KV store handle
+        spin_unlock(&fhandle->lock);
+        handle = (fdb_kvs_handle*)calloc(1, sizeof(fdb_kvs_handle));
+        handle->kvs_config = config_local;
+        atomic_init_uint8_t(&handle->handle_busy, 0);
+
+        handle->fhandle = fhandle;
+        fs = _fdb_open(handle, file->filename, FDB_AFILENAME, &config);
+        if (fs != FDB_RESULT_SUCCESS) {
+            free(handle);
+            *ptr_handle = NULL;
+        } else {
+            // insert into fhandle's list
+            _fdb_kvs_createNLinkKVHandle(fhandle, handle);
+            *ptr_handle = handle;
+        }
+        LATENCY_STAT_END(file, FDB_LATENCY_KVS_OPEN);
+        return fs;
+    }
+
+    if (config.multi_kv_instances == false) {
+        // cannot open KV instance under single DB instance mode
+        return fdb_log(&root_handle->log_callback, FDB_LOG_ERROR,
+                       FDB_RESULT_INVALID_CONFIG,
+                       "Cannot open KV store instance '%s' because multi-KV "
+                       "store instance mode is disabled.",
+                       kvs_name ? kvs_name : DEFAULT_KVS_NAME);
+    }
+    if (root_handle->kvs->type != KVS_ROOT) {
+        return fdb_log(&root_handle->log_callback, FDB_LOG_ERROR,
+                       FDB_RESULT_INVALID_HANDLE,
+                       "Cannot open KV store instance '%s' because the handle "
+                       "doesn't support multi-KV sotre instance mode.",
+                       kvs_name ? kvs_name : DEFAULT_KVS_NAME);
+    }
+    if (root_handle->shandle) {
+        // cannot open KV instance from a snapshot
+        return fdb_log(&root_handle->log_callback, FDB_LOG_ERROR,
+                       FDB_RESULT_INVALID_ARGS,
+                       "Not allowed to open KV store instance '%s' from the "
+                       "snapshot handle.",
+                       kvs_name ? kvs_name : DEFAULT_KVS_NAME);
+    }
+
+    handle = (fdb_kvs_handle *)calloc(1, sizeof(fdb_kvs_handle));
+    if (!handle) { // LCOV_EXCL_START
+        return FDB_RESULT_ALLOC_FAIL;
+    } // LCOV_EXCL_STOP
+
+    atomic_init_uint8_t(&handle->handle_busy, 0);
+    handle->fhandle = fhandle;
+    fs = _fdb_kvs_open(root_handle, &config, &config_local,
+                       latest_file, file->filename, kvs_name, handle);
+    if (fs == FDB_RESULT_SUCCESS) {
+        *ptr_handle = handle;
+    } else {
+        *ptr_handle = NULL;
+        free(handle);
+    }
+    LATENCY_STAT_END(file, FDB_LATENCY_KVS_OPEN);
+    return fs;   
+}
+
 // 1) identify whether the requested KVS is default or non-default.
 // 2) if the requested KVS is default,
 //   2-1) As the root handle is already opened,
@@ -1791,6 +1956,12 @@ fdb_status fdb_kvs_open(fdb_file_handle *fhandle,
             _fdb_kvs_createNLinkKVHandle(fhandle, handle);
             *ptr_handle = handle;
         }
+
+        // if(!(fhandle->root->config.flags & FDB_OPEN_FLAG_RDONLY)) {
+        //     fdb_init_workers(&fhandle->root->config, &handle->kvs_config, 
+        //                       fhandle->root->filename);
+        // }
+
         LATENCY_STAT_END(file, FDB_LATENCY_KVS_OPEN);
         return fs;
     }
@@ -1934,6 +2105,11 @@ fdb_status fdb_kvs_close(fdb_kvs_handle *handle)
         fdb_assert(handle->fhandle->root != handle, handle, NULL);
         // the default KV store but not the root handle .. normally close
         spin_lock(&handle->fhandle->lock);
+
+        // if(!(handle->fhandle->root->config.flags & FDB_OPEN_FLAG_RDONLY)) {
+            // bgflusher_deregister_kv_handle("default");
+        // }
+
         fs = _fdb_close(handle);
         if (fs == FDB_RESULT_SUCCESS) {
             // remove from 'handles' list in the root node
@@ -1953,6 +2129,7 @@ fdb_status fdb_kvs_close(fdb_kvs_handle *handle)
     if (handle->kvs && handle->kvs->root == NULL) {
         return FDB_RESULT_INVALID_ARGS;
     }
+    // bgflusher_deregister_kv_handle(handle->filename);
     fs = _fdb_kvs_close(handle);
     if (fs == FDB_RESULT_SUCCESS) {
         fdb_kvs_info_free(handle);
@@ -2126,7 +2303,6 @@ fdb_kvs_remove_start:
                                 cur_bmp_revnum,
                                 !(root_handle->config.durability_opt & FDB_DRB_ASYNC),
                                 &root_handle->log_callback);
-        btreeblk_reset_subblock_info(root_handle->bhandle);
     }
 
     filemgr_mutex_unlock(file);

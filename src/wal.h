@@ -30,6 +30,11 @@
 extern "C" {
 #endif
 
+struct outstanding_wal {
+    struct list wal;
+    uint32_t count;
+};
+
 typedef uint8_t wal_item_action;
 enum{
     WAL_ACT_INSERT,
@@ -520,6 +525,10 @@ bool wal_txn_exists(struct filemgr *file);
  * @return the memory overhead of a given file manager's WAL index
  */
 size_t wal_get_mem_overhead(struct filemgr *file);
+
+fdb_status _fdb_wal_flush_func(void *voidhandle, struct wal_item *item,
+                    struct avl_tree *stale_seqnum_list,
+                    struct avl_tree *kvs_delta_stats);
 
 #ifdef __cplusplus
 }

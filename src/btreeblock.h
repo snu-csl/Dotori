@@ -63,6 +63,8 @@ struct btreeblk_handle{
     struct filemgr_dirty_update_node *dirty_update;
     // dirty update entry for the current WAL flushing
     struct filemgr_dirty_update_node *dirty_update_writer;
+
+    mutex_t lock;
 };
 
 struct btree_blk_ops *btreeblk_get_ops();
@@ -96,6 +98,7 @@ void btreeblk_reset_subblock_info(struct btreeblk_handle *handle);
 void btreeblk_free(struct btreeblk_handle *handle);
 void btreeblk_discard_blocks(struct btreeblk_handle *handle);
 fdb_status btreeblk_end(struct btreeblk_handle *handle);
+fdb_status btreeblk_free_readlist(struct btreeblk_handle *handle, bool only_leaf);
 
 #ifdef __cplusplus
 }

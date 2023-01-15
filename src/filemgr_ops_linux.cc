@@ -50,6 +50,7 @@ ssize_t _filemgr_linux_pwrite(int fd, void *buf, size_t count, cs_off_t offset)
     ssize_t rv;
     volatile ssize_t local_errno;
     int num_retry = 0;
+    
     do {
         do {
             rv = pwrite(fd, buf, count, offset);
@@ -72,6 +73,7 @@ ssize_t _filemgr_linux_pwrite(int fd, void *buf, size_t count, cs_off_t offset)
         return (ssize_t) convert_errno_to_fdb_status(errno, // LCOV_EXCL_LINE
                                                      FDB_RESULT_WRITE_FAIL);
     }
+
     return rv;
 }
 
@@ -80,6 +82,7 @@ ssize_t _filemgr_linux_pread(int fd, void *buf, size_t count, cs_off_t offset)
     ssize_t rv;
     volatile ssize_t local_errno;
     int num_retry = 0;
+    
     do {
         do {
             rv = pread(fd, buf, count, offset);
@@ -102,6 +105,7 @@ ssize_t _filemgr_linux_pread(int fd, void *buf, size_t count, cs_off_t offset)
         return (ssize_t) convert_errno_to_fdb_status(errno, // LCOV_EXCL_LINE
                                                      FDB_RESULT_READ_FAIL);
     }
+
     return rv;
 }
 

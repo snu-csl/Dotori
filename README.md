@@ -1,32 +1,67 @@
-# ForestDB
+## Compiling
 
-ForestDB is a key-value storage engine that is developed by Couchbase Caching and Storage Team, and its main index structure is built from [Hierarchical B+-Tree based Trie](http://db.csail.mit.edu/sigmod11contest/sigmod_2011_contest_poster_jungsang_ahn.pdf), called HB+-Trie. [HB+-Trie](http://db.csail.mit.edu/sigmod11contest/sigmod_2011_contest_poster_jungsang_ahn.pdf) was originally presented at [ACM SIGMOD 2011 Programming Contest](http://db.csail.mit.edu/sigmod11contest/), by [Jung-Sang Ahn](http://cagsky.kaist.ac.kr/jsahn/) who works at Couchbase Caching and Storage Team.
+```bash
+# Using a real KVSSD
+build.sh REAL
 
-Compared with traditional B+-Tree based storage engines, ForestDB shows significantly better read and write performance with less storage overhead. ForestDB has been tested on various server OS environments (Centos, Ubuntu, Mac OS x, Windows) and mobile OSs (iOS, Android).
+# Using the emulator
+# Works, but performance won't be representative.
+build.sh EMU
 
-ForestDB is currently in [1.0 Beta](https://github.com/couchbaselabs/forestdb/wiki/ForestDB-1.0-Beta) and its GA will be released separately soon. The test coverage stats for ForestDB are available in [ForestDB Code Coverage Report](http://labs.couchbase.com/fdbcoverage/index.html).
+# Remove the KVSSD, Dotori, and benchmark build folders
+build.sh CLEAN
+```
 
-[ForestDB benchmark program](https://github.com/couchbaselabs/ForestDB-Benchmark) is also available for performance comparisons with other key-value storage engines.
+This will build the KVSSD software, the Dotori library, and the benchmark.
+See inside the script for each step. The Dotori library and the KVSSD libraries
+will be copied to the resulting build folder.
 
-Please visit the [ForestDB wiki](https://github.com/couchbaselabs/forestdb/wiki) for more details.
+## Running the benchmarks
 
-## Main Features
+### Preconditioning
 
-- Keys and values are treated as an arbitrary binary.
-- Applications can supply a custom compare function to support a customized key order.
-- A value can be retrieved by its sequence number or disk offset in addition to a key.
-- Write-Ahead Logging (WAL) and its in-memory index are used to reduce the main index lookup / update overhead.
-- Multi-Version Concurrency Control (MVCC) support and append-only storage layer.
-- Multiple snapshot instances can be created from a given ForestDB instance to provide different views of database.
-- Rollback is supported to revert the database to a specific point.
-- Ranged iteration by keys or sequence numbers is supported for a partial or full range lookup operation.
-- Manual or auto compaction can be configured per ForestDB database file.
-- Transactional support with read\_committed or read\_uncommitted isolation level.
+To precondition the KVSSD, update precondition.sh to point to your KVSSD path (e.g. /dev/nvme0n1) and run it.
+The process will take several hours.
+The preconditioning stage is not required to run the YCSB benchmarks below.
 
-## How to build
+### YCSB
 
-See INSTALL.MD
+Included in the benchmark directory is the set of configuration files used for the YCSB tests. To run a test :
 
-## How to Use
+```bash
+cd bench/dotori
+nvme format /dev/nvme0n1
 
-Please refer to [Public APIs](https://github.com/couchbaselabs/forestdb/wiki/Public-APIs) and tests/fdb\_functional\_test.cc in ForestDB source directory.
+# Populate the database and run the benchmark
+# Requires sudo if using a real KVSSD
+LD_LIBRARY_PATH=../../build/ ./dotori_bench -f ../ycsb_med/ycsba_uniform.ini
+
+# Skip population and run the benchmark only
+# Won't work on the emulator, as closing the emulator (in the previous population run) wipes the data
+# Requires sudo if using a real KVSSD
+LD_LIBRARY_PATH=../../build/ ./dotori_bench -e -f ../ycsb_med/ycsba_uniform.ini
+```
+
+### Large dataset performance test
+
+```bash
+cd bench/dotori
+
+# Populate the database and run the benchmark
+# Requires sudo if using a real KVSSD
+# The test where roughly 55% of the device is filled
+LD_LIBRARY_PATH=../../build/ ./dotori_bench -f ../large_dataset_test/big_55.ini
+
+# The test where roughly 80% of the device is filled
+LD_LIBRARY_PATH=../../build/ ./dotori_bench -f ../large_dataset_test/big_80.ini
+```
+
+## Comments 
+
+Dotori started as an extension of ForestDB, and thus the code still contains a lot of block-device and file-related references and naming schemes. Working with blocks and files isn't really required when using a KVSSD. This also means that there are a lot of references to "fdb" instead of "dotori" in the code.
+
+For examples of how to use Dotori, please see [the benchmark wrapper](bench/wrappers/couch\_dotori.cc) and [the functionality tests](tests/functional/fdb\_functional\_test.cc).
+
+## Acknowledgements
+
+We thank the authors of https://github.com/BLepers/KVell and https://github.com/cameron314/concurrentqueue, whose work we modified and used in Dotori.

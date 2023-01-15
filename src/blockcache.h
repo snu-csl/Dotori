@@ -46,6 +46,7 @@ void bcache_remove_clean_blocks(struct filemgr *file);
 bool bcache_remove_file(struct filemgr *file);
 uint64_t bcache_get_num_blocks(struct filemgr *file);
 fdb_status bcache_flush(struct filemgr *file);
+fdb_status bcache_flush_logs(struct filemgr *file);
 uint64_t bcache_get_num_immutable(struct filemgr *file);
 fdb_status bcache_flush_immutable(struct filemgr *file);
 void bcache_shutdown();

@@ -9,6 +9,9 @@
 
 #include <stdint.h>
 #include "common.h"
+#include "docio.h"
+#include <string>
+#include <unordered_map>
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,7 +28,8 @@ extern "C" {
 typedef enum {
     BTREE_RESULT_SUCCESS,
     BTREE_RESULT_UPDATE,
-    BTREE_RESULT_FAIL
+    BTREE_RESULT_FAIL,
+    BTREE_RESULT_AIO
 } btree_result;
 
 //#define _BTREE_32BIT_IDX
@@ -54,6 +58,10 @@ struct bnode{
         // union is changed.
         uint64_t dummy;
     };
+    std::string *log;
+    bid_t bid;
+    bool append;
+    mutex_t lock;
 };
 #define BNODE_MASK_ROOT 0x1
 #define BNODE_MASK_METADATA 0x2
@@ -65,6 +73,8 @@ struct btree_meta{
     void *data;
 };
 
+uint32_t _get_bnode_write_len(void *value, uint32_t *nentry_out, bool encode);
+
 typedef void* voidref;
 typedef struct bnode* bnoderef;
 
@@ -74,6 +84,7 @@ struct btree_blk_ops {
     voidref (*blk_enlarge_node)(void *voidhandle, bid_t old_bid,
                                 size_t req_size, bid_t *new_bid);
     voidref (*blk_read)(void *handle, bid_t bid);
+    voidref (*blk_read_leaf)(void *handle, bid_t bid);
     voidref (*blk_move)(void *handle, bid_t bid, bid_t *new_bid);
     void (*blk_remove)(void *handle, bid_t bid);
     int (*blk_is_writable)(void *handle, bid_t bid);
@@ -97,6 +108,18 @@ struct btree {
 #ifdef __UTREE
     uint16_t leafsize;
 #endif
+};
+
+enum btree_find_state {
+    BLK_READ = 0,
+    ROUTING_NODE,
+    LEAF_NODE,
+};
+
+enum btree_insert_state {
+    INSERT_BLK_READ = 0,
+    INSERT_ROUTING_NODE,
+    INSERTION
 };
 
 typedef int btree_cmp_func(void *key1, void *key2, void *aux);
@@ -164,8 +187,12 @@ struct btree_iterator {
         (iterator)->flags |= BTREE_ITERATOR_FWD;\
     }while (0)
 
-typedef void btree_print_func(struct btree *btree, void *key, void *value);
+typedef void btree_print_func(struct btree *btree, void *key, void *value, int depth);
 void btree_print_node(struct btree *btree, btree_print_func func);
+void btree_find_all_node(struct btree *btree);
+void btree_find_all_node_async(struct btree *btree);
+void btree_mark_all_nodes_dirty(struct btree *btree);
+void btree_persist_image(struct btree *btree);
 
 //#define _BTREE_HAS_MULTIPLE_BNODES
 #ifdef _BTREE_HAS_MULTIPLE_BNODES
@@ -179,6 +206,10 @@ btree_result btree_init_from_bid(
         struct btree *btree, void *blk_handle,
         struct btree_blk_ops *blk_ops,     struct btree_kv_ops *kv_ops,
         uint32_t nodesize, bid_t root_bid);
+btree_result btree_init_from_bid_async(
+        struct btree *btree, void *blk_handle,
+        struct btree_blk_ops *blk_ops, struct btree_kv_ops *kv_ops,
+        uint32_t nodesize, bid_t root_bid, struct async_read_ctx_t *ctx);
 btree_result btree_init(
         struct btree *btree, void *blk_handle,
         struct btree_blk_ops *blk_ops,     struct btree_kv_ops *kv_ops,
@@ -194,9 +225,17 @@ btree_result btree_get_key_range(
     struct btree *btree, idx_t num, idx_t den, void *key_begin, void *key_end);
 
 btree_result btree_find(struct btree *btree, void *key, void *value_buf);
+btree_result btree_find_async(struct btree *btree, void *key, void *value_buf, 
+                              struct async_read_ctx_t *ctx);
 btree_result btree_insert(struct btree *btree, void *key, void *value);
+btree_result btree_insert_get_old(struct btree *btree, void *key, void *value, void* oldvalue_out);
+btree_result btree_forced_insert(struct btree *btree, void *key, void *value);
+btree_result btree_forced_insert_get_old(struct btree *btree, void *key, void *value, void* oldvalue_out);
 btree_result btree_remove(struct btree *btree, void *key);
 btree_result btree_operation_end(struct btree *btree);
+btree_result btree_repack(struct btree *btree, void *key);
+btree_result btree_repack_async(struct btree *btree, void *key, 
+                                struct async_read_ctx_t *ctx);
 
 #ifdef __cplusplus
 }

@@ -145,6 +145,8 @@ struct kvs_stat {
 };
 
 // Versioning information...
+// Version 003 - key-value SSD support, no stale tree
+#define FILEMGR_MAGIC_003 (UINT64_C(0xdeadcafebeefc003))
 // Version 002 - added stale-block tree info
 #define FILEMGR_MAGIC_002 (UINT64_C(0xdeadcafebeefc002))
 // Version 001 - added delta size to DB header and CRC-32C
@@ -154,7 +156,7 @@ struct kvs_stat {
 //               unexpected behavior or crash, this magic number is no longer
 //               supported.)
 #define FILEMGR_MAGIC_000 (UINT64_C(0xdeadcafebeefbeef))
-#define FILEMGR_LATEST_MAGIC FILEMGR_MAGIC_002
+#define FILEMGR_LATEST_MAGIC FILEMGR_MAGIC_003
 
 /**
  * Atomic counters of operational statistics in ForestDB KV store.
@@ -307,6 +309,8 @@ struct _fdb_kvs_handle {
         dirty_updates = kv_handle.dirty_updates;
         node = kv_handle.node;
         num_iterators = kv_handle.num_iterators;
+        last_commit_id = kv_handle.last_commit_id;
+        max_vernum = kv_handle.max_vernum;
         return *this;
     }
 
@@ -432,6 +436,19 @@ struct _fdb_kvs_handle {
      * Number of active iterator instances created from this handle
      */
     uint32_t num_iterators;
+    /**
+     ForestKV Modification
+     Last commit ID
+     */
+    uint64_t last_commit_id;
+    /**
+     * KV store's max version number for snapshot or rollback.
+     */
+    fdb_seqnum_t max_vernum;
+
+    atomic_uint8_t recovering;
+
+    bool from_rmw;
 };
 
 struct hbtrie_iterator;
@@ -577,6 +594,15 @@ struct _fdb_iterator {
      * Cursor offset to key, meta and value on disk
      */
     uint64_t _get_offset;
+};
+
+/**
+ * ForestDB iterator structure definition.
+ */
+struct _fdb_kvssd_iterator {
+    struct kvssd_iterator_info *iter_info;
+    unsigned char *prefix;
+    uint32_t shift = 0;
 };
 
 struct wal_txn_wrapper;
@@ -726,6 +752,7 @@ struct stale_data {
      * Length of the stale data
      */
     uint32_t len;
+    void *key;
     union {
         struct list_elem le;
         struct avl_node avl;

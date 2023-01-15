@@ -229,9 +229,16 @@ const char* fdb_error_msg(fdb_status err_code)
             return "A file is too large to be opened";
         case FDB_RESULT_EAGAIN:
             return "Resource temporarily unavailable";
-
         case FDB_RESULT_ALREADY_COMPACTED:
             return "DB file has been already compacted";
+        case FDB_RESULT_ESNAPSHOTOPEN:
+            return "A snapshot was open when trying to delete stale keys";
+        case FDB_RESULT_MISS:
+            return "Cache miss";
+        case FDB_RESULT_ITERATOR_OPEN:
+            return "Iterator for this prefix already open";
+        case FDB_RESULT_ITERATOR_MAX:
+            return "Too many open iterators";
 
         default:
             return "unknown error";

@@ -1,7 +1,14 @@
 # Keep the entries sorted to reduce the risk for a merge conflict
 *.[ao]
+*.swp
+bench/dotori
 couchstore_api/couchbench_fdb
 build
+emu
+buildxcode
+buildrelease
+cmake-build-debug
+cmake-build-debug-remote
 coverage
 platform
 dummy2
@@ -10,6 +17,7 @@ forestdb_test
 libforestdb.so
 libforestdb_couch.so
 src/wc
+tags
 tests/bcache_test
 tests/btreeblock_test
 tests/crc_test
@@ -20,3 +28,6 @@ tests/hbtrie_test
 tests/list_test
 tests/mempool_test
 wt2
+KVSSD/PDK/core/build
+.idea
+.DS_Store

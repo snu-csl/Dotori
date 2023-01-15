@@ -1,0 +1,58 @@
+Release version 1.2.0
+
+This package provides a generic interface for user to communicate with Samsung's Key Value SSD through different types of device drivers (user space, and kernel space), and a Samsung Key Value SSD emulator. 
+
+---
+How to build:
+    0. Install dependencies
+       - ./tools/install_deps.sh
+       - gcc version should be newer than v5.0
+    1. mkdir build
+    2. cd build
+    3. Three types of driver are available for SNIA KV Storage API: kernel driver (KDD); emulator (EMU); user space driver (SPDK)
+       User can compile one of them with following options:
+
+       Kernel Device Driver
+       =======
+       cmake -DWITH_KDD=ON ../
+
+       Emulator 
+       =======
+       cmake -DWITH_EMU=ON ../
+
+       User Space Driver
+       =======
+       cmake -DWITH_SPDK=ON ../ 
+
+       * Replace <main_source_dir>/lib/libkvnvmedd.a if there is newer version of spdk driver available or if user wants to rebuild the driver
+       * The pre-build library is on gcc version 5.4.0
+       * https://github.com/OpenMPDK/uNVMe v18.11
+
+    4. make -j<# of jobs>
+       * # of jobs: execute multiple recipes simultaneously
+       
+
+---
+How to test
+    library and test binaries are at:
+    build/
+
+
+    0. ./sample_code_async -h
+       ./sample_code_sync -h
+    
+    1. Test with Kernel Driver
+    - nvme kernel module needs to be compiled and installed
+
+    sudo ./sample_code_async -d device_path [-n num_ios] [-q queue_depth] [-o op_type] [-k klen] [-v vlen]
+    sudo ./sample_code_sync -d device_path [-n num_ios] [-o op_type] [-k klen] [-v vlen] [-t threads]
+
+    e.g. ./sample_code_async -d /dev/nvme0n1 -n 100 -q 64 -o 1 -k 16 -v 4096
+
+    2. Test with SPDK Driver
+     - /KVSSD/PDK/core/tools/setup.sh
+     - ./sample_code_async -d 0000:06:00.0 -n 100 -q 64 -o 1 -k 16 -v 4096
+     - /KVSSD/PDK/core/tools/setup.sh reset
+     
+    PS: When test SNIA KV Storage API, make sure configuration file env_init.conf is in the upper directory of working directory
+        SNIA KV Storage API configuration file env_init.conf and emulator configuration file kvssd_emul.conf are described in KVSSD_QUICK_START_GUIDE

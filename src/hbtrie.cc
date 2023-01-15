@@ -26,6 +26,7 @@
 #include "btree_fast_str_kv.h"
 #include "internal_types.h"
 #include "log_message.h"
+#include "btreeblock.h"
 
 #include "memleak.h"
 
@@ -51,17 +52,17 @@ struct hbtrie_meta {
     void *prefix;
 };
 
-#define _l2c(trie, len) (( (len) + ((trie)->chunksize-1) ) / (trie)->chunksize)
+#define _l2c(trie, len) (( (len) ) / (trie)->chunksize)
 
 // MUST return same value to '_get_nchunk(_hbtrie_reform_key(RAWKEY))'
 INLINE int _get_nchunk_raw(struct hbtrie *trie, void *rawkey, int rawkeylen)
 {
-    return _l2c(trie, rawkeylen) + 1;
+    return _l2c(trie, rawkeylen);
 }
 
 INLINE int _get_nchunk(struct hbtrie *trie, void *key, int keylen)
 {
-    return (keylen-1) / trie->chunksize + 1;
+    return (keylen) / trie->chunksize;
 }
 
 int _hbtrie_reform_key(struct hbtrie *trie, void *rawkey,
@@ -74,6 +75,8 @@ int _hbtrie_reform_key(struct hbtrie *trie, void *rawkey,
     size_t csize = trie->chunksize;
 
     nchunk = _get_nchunk_raw(trie, rawkey, rawkeylen);
+    if (nchunk == 0)
+        nchunk = 1;
     outkeylen = nchunk * csize;
 
     if (nchunk > 2) {
@@ -94,7 +97,9 @@ int _hbtrie_reform_key(struct hbtrie *trie, void *rawkey,
     if (rsize < csize) {
         // zero-fill rest space
         i = nchunk - 2;
-        memset((uint8_t*)outkey + (i*csize) + rsize, 0x0, 2*csize - rsize);
+        memset((uint8_t*) outkey + rsize, 0x0, csize - rsize);
+        //memset((uint8_t*)outkey + (i*csize) + rsize, 0x0, 2*csize - rsize);
+    } else if (rsize == csize) {
     } else {
         // zero-fill the last chunk
         i = nchunk - 1;
@@ -102,7 +107,7 @@ int _hbtrie_reform_key(struct hbtrie *trie, void *rawkey,
     }
 
     // assign rsize at the end of the outkey
-    *((uint8_t*)outkey + outkeylen - 1) = rsize;
+//    *((uint8_t*)outkey + outkeylen - 1) = rsize;
 
     return outkeylen;
 }
@@ -1171,93 +1176,46 @@ static void _hbtrie_free_btreelist(struct list *btreelist)
     }
 }
 
-static void _hbtrie_btree_cascaded_update(struct hbtrie *trie,
-                                          struct list *btreelist,
-                                          void *key,
-                                          int free_opt)
+#ifdef __ENDIAN_SAFE
+INLINE struct docio_length _docio_length_encode(struct docio_length length)
 {
-    bid_t bid_new, _bid;
-    struct btreelist_item *btreeitem, *btreeitem_child;
-    struct list_elem *e, *e_child;
-
-    e = e_child = NULL;
-
-    //3 cascaded update of each b-tree from leaf to root
-    e_child = list_end(btreelist);
-    if (e_child) e = list_prev(e_child);
-
-    while(e && e_child) {
-        btreeitem = _get_entry(e, struct btreelist_item, e);
-        btreeitem_child = _get_entry(e_child, struct btreelist_item, e);
-
-        if (btreeitem->child_rootbid != btreeitem_child->btree.root_bid) {
-            // root node of child sub-tree has been moved to another block
-            // update parent sub-tree
-            bid_new = btreeitem_child->btree.root_bid;
-            _bid = _endian_encode(bid_new);
-            _hbtrie_set_msb(trie, (void *)&_bid);
-            btree_insert(&btreeitem->btree,
-                    (uint8_t*)key + btreeitem->chunkno * trie->chunksize,
-                    (void *)&_bid);
-        }
-        e_child = e;
-        e = list_prev(e);
-    }
-
-    // update trie root bid
-    if (e) {
-        btreeitem = _get_entry(e, struct btreelist_item, e);
-        trie->root_bid = btreeitem->btree.root_bid;
-    }else if (e_child) {
-        btreeitem = _get_entry(e_child, struct btreelist_item, e);
-        trie->root_bid = btreeitem->btree.root_bid;
-    }else {
-        fdb_assert(0, trie, e_child);
-    }
-
-    if (free_opt) {
-        _hbtrie_free_btreelist(btreelist);
-    }
+    struct docio_length ret;
+    ret = length;
+    ret.keylen = _endian_encode(length.keylen);
+    ret.metalen = _endian_encode(length.metalen);
+    ret.bodylen = _endian_encode(length.bodylen);
+    ret.bodylen_ondisk = _endian_encode(length.bodylen_ondisk);
+    return ret;
 }
+INLINE struct docio_length _docio_length_decode(struct docio_length length)
+{
+    struct docio_length ret;
+    ret = length;
+    ret.keylen = _endian_decode(length.keylen);
+    ret.metalen = _endian_decode(length.metalen);
+    ret.bodylen = _endian_decode(length.bodylen);
+    ret.bodylen_ondisk = _endian_decode(length.bodylen_ondisk);
+    return ret;
+}
+#else
+#define _docio_length_encode(a)
+#define _docio_length_decode(a)
+#endif
 
 static hbtrie_result _hbtrie_find(struct hbtrie *trie, void *key, int keylen,
-                                  void *valuebuf, struct list *btreelist, uint8_t flag)
+        void *valuebuf, struct list *btreelist, uint8_t flag,
+        bool async_read, struct async_read_ctx_t *ctx)
 {
-    int nchunk;
-    int rawkeylen;
-    int prevchunkno, curchunkno, cpt_node = 0;
     struct btree *btree = NULL;
     struct btree btree_static;
     btree_result r;
-    struct hbtrie_meta hbmeta;
-    struct btree_meta meta;
     struct btreelist_item *btreeitem = NULL;
-    uint8_t *k = alca(uint8_t, trie->chunksize);
-    uint8_t *buf = alca(uint8_t, trie->btree_nodesize);
-    uint8_t *btree_value = alca(uint8_t, trie->valuelen);
-    void *chunk = NULL;
-    hbtrie_cmp_func *void_cmp;
-    bid_t bid_new;
-    nchunk = _get_nchunk(trie, key, keylen);
+    struct btreeblk_handle *bhandle;
 
-    meta.data = buf;
-    curchunkno = 0;
-
-    if (trie->map) { // custom cmp functions exist
-        if (!memcmp(trie->last_map_chunk, key, trie->chunksize)) {
-            // same custom function was used in the last call .. do nothing
-        } else {
-            // get cmp function corresponding to the key
-            void* user_param;
-            trie->map(key, (void *)trie, &void_cmp, &user_param);
-            if (void_cmp) { // custom cmp function matches .. turn on leaf b+tree mode
-                memcpy(trie->last_map_chunk, key, trie->chunksize);
-                // set aux for _fdb_custom_cmp_wrap()
-                trie->cmp_args.cmp_func = void_cmp;
-                trie->cmp_args.user_param = user_param;
-                trie->aux = &trie->cmp_args;
-            }
-        }
+    if(async_read) {
+        bhandle = ctx->bhandle;
+    } else {
+        bhandle = (struct btreeblk_handle*) trie->btreeblk_handle;
     }
 
     if (btreelist) {
@@ -1266,7 +1224,11 @@ static hbtrie_result _hbtrie_find(struct hbtrie *trie, void *key, int keylen,
         list_push_back(btreelist, &btreeitem->e);
         btree = &btreeitem->btree;
     } else {
-        btree = &btree_static;
+        if(async_read) {
+            btree = (struct btree*)malloc(sizeof(*btree));
+        } else {
+            btree = &btree_static;
+        }
     }
 
     if (trie->root_bid == BLK_NOT_FOUND) {
@@ -1274,7 +1236,7 @@ static hbtrie_result _hbtrie_find(struct hbtrie *trie, void *key, int keylen,
         return HBTRIE_RESULT_FAIL;
     } else {
         // read from root_bid
-        r = btree_init_from_bid(btree, trie->btreeblk_handle, trie->btree_blk_ops,
+        r = btree_init_from_bid(btree, bhandle, trie->btree_blk_ops,
                                 trie->btree_kv_ops, trie->btree_nodesize,
                                 trie->root_bid);
         if (r != BTREE_RESULT_SUCCESS) {
@@ -1291,182 +1253,30 @@ static hbtrie_result _hbtrie_find(struct hbtrie *trie, void *key, int keylen,
         }
     }
 
-    while (curchunkno < nchunk) {
-        // get current chunk number
-        meta.size = btree_read_meta(btree, meta.data);
-        _hbtrie_fetch_meta(trie, meta.size, &hbmeta, meta.data);
-        prevchunkno = curchunkno;
-        if (_is_leaf_btree(hbmeta.chunkno)) {
-            cpt_node = 1;
-            hbmeta.chunkno = _get_chunkno(hbmeta.chunkno);
-            btree->kv_ops = trie->btree_leaf_kv_ops;
-        }
-        curchunkno = hbmeta.chunkno;
-
-        if (btreelist) {
-            btreeitem->chunkno = curchunkno;
-            btreeitem->leaf = cpt_node;
-        }
-
-        //3 check whether there are skipped prefixes.
-        if (curchunkno - prevchunkno > 1) {
-            fdb_assert(hbmeta.prefix != NULL, hbmeta.prefix, trie);
-            // prefix comparison (find the first different chunk)
-            int diffchunkno = _hbtrie_find_diff_chunk(
-                trie, hbmeta.prefix,
-                (uint8_t*)key + trie->chunksize * (prevchunkno+1),
-                0, curchunkno - (prevchunkno+1));
-            if (diffchunkno < curchunkno - (prevchunkno+1)) {
-                // prefix does not match -> retrieval fail
-                return HBTRIE_RESULT_FAIL;
-            }
-        }
-
-        //3 search b-tree using current chunk (or postfix)
-        rawkeylen = _hbtrie_reform_key_reverse(trie, key, keylen);
-        if ((cpt_node && rawkeylen == curchunkno * trie->chunksize) ||
-            (!cpt_node && nchunk == curchunkno)) {
-            // KEY is exactly same as tree's prefix .. return value in metasection
-            if (hbmeta.value && trie->valuelen > 0) {
-                memcpy(valuebuf, hbmeta.value, trie->valuelen);
-            }
-            return HBTRIE_RESULT_SUCCESS;
-        } else {
-            chunk = (uint8_t*)key + curchunkno*trie->chunksize;
-            if (cpt_node) {
-                // leaf b-tree
-                size_t rawchunklen =
-                    _hbtrie_reform_key_reverse(trie, chunk,
-                    (nchunk-curchunkno)*trie->chunksize);
-
-                _set_leaf_key(k, chunk, rawchunklen);
-                r = btree_find(btree, k, btree_value);
-                _free_leaf_key(k);
-            } else {
-                r = btree_find(btree, chunk, btree_value);
-            }
-        }
-
-        if (r == BTREE_RESULT_FAIL) {
-            // retrieval fail
-            return HBTRIE_RESULT_FAIL;
-        } else {
-            // same chunk exists
-            if (flag & HBTRIE_PARTIAL_MATCH &&
-                curchunkno + 1 == nchunk - 1) {
-                // partial match mode & the last meaningful chunk
-                // return btree value
-                memcpy(valuebuf, btree_value, trie->valuelen);
-                return HBTRIE_RESULT_SUCCESS;
-            }
-
-            // check whether the value points to sub-tree or document
-            // check MSB
-            if (_hbtrie_is_msb_set(trie, btree_value)) {
-                // this is BID of b-tree node (by clearing MSB)
-                _hbtrie_clear_msb(trie, btree_value);
-                bid_new = trie->btree_kv_ops->value2bid(btree_value);
-                bid_new = _endian_decode(bid_new);
-
-                if (btreelist) {
-                    btreeitem->child_rootbid = bid_new;
-                    btreeitem = (struct btreelist_item *)
-                                mempool_alloc(sizeof(struct btreelist_item));
-                    list_push_back(btreelist, &btreeitem->e);
-                    btree = &btreeitem->btree;
-                }
-
-                // fetch sub-tree
-                r = btree_init_from_bid(btree, trie->btreeblk_handle, trie->btree_blk_ops,
-                                        trie->btree_kv_ops, trie->btree_nodesize, bid_new);
-                if (r != BTREE_RESULT_SUCCESS) {
-                    return HBTRIE_RESULT_FAIL;
-                }
-                btree->aux = trie->aux;
-            } else {
-                // this is offset of document (as it is), read entire key
-
-                // Allocate docrawkey, dockey on the heap just for windows
-                // as stack over flow issues are sometimes seen (because of
-                // smaller process stack size).
-                // TODO: Maintaining a simple global buffer pool and reusing
-                // it would be better than allocating space for every operation.
-#if defined(WIN32) || defined(_WIN32)
-                uint8_t *docrawkey = (uint8_t *) malloc(HBTRIE_MAX_KEYLEN);
-                uint8_t *dockey = (uint8_t *) malloc(HBTRIE_MAX_KEYLEN);
-#else
-                uint8_t *docrawkey = alca(uint8_t, HBTRIE_MAX_KEYLEN);
-                uint8_t *dockey = alca(uint8_t, HBTRIE_MAX_KEYLEN);
-#endif
-                int dockeylen = 0;
-                uint32_t docrawkeylen = 0;
-                uint64_t offset;
-                int docnchunk, diffchunkno;
-
-                hbtrie_result result = HBTRIE_RESULT_SUCCESS;
-
-                // get offset value from btree_value
-                offset = trie->btree_kv_ops->value2bid(btree_value);
-                if (!(flag & HBTRIE_PREFIX_MATCH_ONLY)) {
-                    // read entire key
-                    docrawkeylen = trie->readkey(trie->doc_handle, offset, docrawkey);
-                    dockeylen = _hbtrie_reform_key(trie, docrawkey, docrawkeylen, dockey);
-                    if (dockeylen < 0) {
-                        // Critical error, return.
-                        fdb_log(nullptr, FDB_LOG_FATAL,
-                                FDB_RESULT_FILE_CORRUPTION,
-                                "hb-trie corruption, btree %lx, trie %lx, "
-                                "offset %lx",
-                                btree->root_bid,
-                                trie->root_bid,
-                                offset);
-                        free(docrawkey);
-                        free(dockey);
-                        return HBTRIE_RESULT_INDEX_CORRUPTED;
-                    }
-
-                    // find first different chunk
-                    docnchunk = _get_nchunk(trie, dockey, dockeylen);
-
-                    if (docnchunk == nchunk) {
-                        diffchunkno = _hbtrie_find_diff_chunk(trie, key,
-                                            dockey, curchunkno, nchunk);
-                        if (diffchunkno == nchunk) {
-                            // success
-                            memcpy(valuebuf, btree_value, trie->valuelen);
-                        } else {
-                            result = HBTRIE_RESULT_FAIL;
-                        }
-                    } else {
-                        result = HBTRIE_RESULT_FAIL;
-                    }
-                } else {
-                    // just return value
-                    memcpy(valuebuf, btree_value, trie->valuelen);
-                }
-
-#if defined(WIN32) || defined(_WIN32)
-                // Free heap memory that was allocated only for windows
-                free(docrawkey);
-                free(dockey);
-#endif
-                return result;
-            }
-        }
+    if(async_read) {
+		assert(0);
+    } else {
+        r = btree_find(btree, key, valuebuf);
+        btreeblk_end(bhandle);
     }
 
-    return HBTRIE_RESULT_FAIL;
+    if (r == BTREE_RESULT_FAIL) {
+        return HBTRIE_RESULT_FAIL;
+    }
+
+    return HBTRIE_RESULT_SUCCESS;
 }
 
 hbtrie_result hbtrie_find(struct hbtrie *trie, void *rawkey,
                           int rawkeylen, void *valuebuf)
 {
-    int nchunk = _get_nchunk_raw(trie, rawkey, rawkeylen);
+    //int nchunk = _get_nchunk_raw(trie, rawkey, rawkeylen);
+    int nchunk = 1;
     uint8_t *key = alca(uint8_t, nchunk * trie->chunksize);
     int keylen;
 
     keylen = _hbtrie_reform_key(trie, rawkey, rawkeylen, key);
-    return _hbtrie_find(trie, key, keylen, valuebuf, NULL, 0x0);
+    return _hbtrie_find(trie, key, keylen, valuebuf, NULL, 0x0, false, NULL);
 }
 
 hbtrie_result hbtrie_find_offset(struct hbtrie *trie, void *rawkey,
@@ -1478,7 +1288,7 @@ hbtrie_result hbtrie_find_offset(struct hbtrie *trie, void *rawkey,
 
     keylen = _hbtrie_reform_key(trie, rawkey, rawkeylen, key);
     return _hbtrie_find(trie, key, keylen, valuebuf, NULL,
-                        HBTRIE_PREFIX_MATCH_ONLY);
+                        HBTRIE_PREFIX_MATCH_ONLY, false, NULL);
 }
 
 hbtrie_result hbtrie_find_partial(struct hbtrie *trie, void *rawkey,
@@ -1490,85 +1300,100 @@ hbtrie_result hbtrie_find_partial(struct hbtrie *trie, void *rawkey,
 
     keylen = _hbtrie_reform_key(trie, rawkey, rawkeylen, key);
     return _hbtrie_find(trie, key, keylen, valuebuf, NULL,
-                        HBTRIE_PARTIAL_MATCH);
+                        HBTRIE_PARTIAL_MATCH, false, NULL);
+}
+
+hbtrie_result hbtrie_find_async(struct hbtrie *trie, void *rawkey,
+                                int rawkeylen, void *valuebuf, 
+                                struct async_read_ctx_t *ctx)
+{
+    return _hbtrie_find(trie, rawkey, rawkeylen, valuebuf, NULL, 0x0, true, ctx);
 }
 
 INLINE hbtrie_result _hbtrie_remove(struct hbtrie *trie,
                                     void *rawkey, int rawkeylen,
                                     uint8_t flag)
 {
-    int nchunk = _get_nchunk_raw(trie, rawkey, rawkeylen);
+    //int nchunk = _get_nchunk_raw(trie, rawkey, rawkeylen);
+    //int keylen;
+    //uint8_t *key = alca(uint8_t, nchunk * trie->chunksize);
+    //uint8_t *valuebuf = alca(uint8_t, trie->valuelen);
+    //hbtrie_result r;
+    //btree_result br = BTREE_RESULT_SUCCESS;
+    //struct list btreelist;
+    //struct btreelist_item *btreeitem;
+    //struct list_elem *e;
+
+    hbtrie_result ret_result = HBTRIE_RESULT_SUCCESS;
+    btree_result r;
     int keylen;
-    uint8_t *key = alca(uint8_t, nchunk * trie->chunksize);
-    uint8_t *valuebuf = alca(uint8_t, trie->valuelen);
-    hbtrie_result r;
-    btree_result br = BTREE_RESULT_SUCCESS;
-    struct list btreelist;
-    struct btreelist_item *btreeitem;
-    struct list_elem *e;
 
-    keylen = _hbtrie_reform_key(trie, rawkey, rawkeylen, key);
+    struct btree *btree = NULL;
+    struct btree btree_static;
 
-    r = _hbtrie_find(trie, key, keylen, valuebuf, &btreelist, flag);
-
-    if (r == HBTRIE_RESULT_SUCCESS) {
-        e = list_end(&btreelist);
-        fdb_assert(e, trie, flag);
-
-        btreeitem = _get_entry(e, struct btreelist_item, e);
-        if (btreeitem &&
-            ((btreeitem->leaf && rawkeylen == btreeitem->chunkno * trie->chunksize) ||
-             (!(btreeitem->leaf) && nchunk == btreeitem->chunkno)) ) {
-            // key is exactly same as b-tree's prefix .. remove from metasection
-            struct hbtrie_meta hbmeta;
-            struct btree_meta meta;
-            hbmeta_opt opt;
-            uint8_t *buf = alca(uint8_t, trie->btree_nodesize);
-
-            meta.data = buf;
-            meta.size = btree_read_meta(&btreeitem->btree, meta.data);
-            _hbtrie_fetch_meta(trie, meta.size, &hbmeta, meta.data);
-
-            opt = (_is_leaf_btree(hbmeta.chunkno))?(HBMETA_LEAF):(HBMETA_NORMAL);
-
-            // remove value from metasection
-            _hbtrie_store_meta(
-                    trie, &meta.size, _get_chunkno(hbmeta.chunkno), opt,
-                    hbmeta.prefix, hbmeta.prefix_len, NULL, buf);
-            btree_update_meta(&btreeitem->btree, &meta);
-        } else {
-            if (btreeitem && btreeitem->leaf) {
-                // leaf b-tree
-                uint8_t *k = alca(uint8_t, trie->chunksize);
-                _set_leaf_key(k, key + btreeitem->chunkno * trie->chunksize,
-                    rawkeylen - btreeitem->chunkno * trie->chunksize);
-                br = btree_remove(&btreeitem->btree, k);
-                _free_leaf_key(k);
-            } else if (btreeitem) {
-                // normal b-tree
-                br = btree_remove(&btreeitem->btree,
-                                  key + trie->chunksize * btreeitem->chunkno);
-            }
-            if (br == BTREE_RESULT_FAIL) {
-                r = HBTRIE_RESULT_FAIL;
-            }
-        }
-        _hbtrie_btree_cascaded_update(trie, &btreelist, key, 1);
-    } else {
-        // key (to be removed) not found
-        // no update occurred .. we don't need to update b-trees on the path
-        // just free the btreelist
-        _hbtrie_free_btreelist(&btreelist);
+    keylen = rawkeylen;
+    if (keylen != 8) {
+        fprintf(stderr, "Invalid keylen\n");
+        assert(0);
     }
 
-    return r;
+    auto bhandle = (struct btreeblk_handle*)trie->btreeblk_handle;
+
+    btree = &btree_static;
+    if (trie->root_bid == BLK_NOT_FOUND) {
+        // create root b-tree
+        r = btree_init(btree, trie->btreeblk_handle,
+                trie->btree_blk_ops, trie->btree_kv_ops,
+                trie->btree_nodesize, trie->chunksize,
+                trie->valuelen, 0x0, NULL);
+        btree->aux = trie->aux;
+        if (r != BTREE_RESULT_SUCCESS) {
+            assert(0);
+            return HBTRIE_RESULT_FAIL;
+        }
+
+        btreeblk_end(bhandle);
+    } else {
+        // read from root_bid
+        r = btree_init_from_bid(btree, trie->btreeblk_handle,
+                trie->btree_blk_ops, trie->btree_kv_ops,
+                trie->btree_nodesize, trie->root_bid);
+        btree->aux = trie->aux;
+        if (r != BTREE_RESULT_SUCCESS) {
+            assert(0);
+            return HBTRIE_RESULT_FAIL;
+        }
+        if (btree->ksize != trie->chunksize || btree->vsize != trie->valuelen) {
+            if (((trie->chunksize << 4) | trie->valuelen) == btree->ksize) {
+                // this is an old meta format
+                return HBTRIE_RESULT_INDEX_VERSION_NOT_SUPPORTED;
+            }
+            // B+tree root node is corrupted.
+            assert(0);
+            return HBTRIE_RESULT_INDEX_CORRUPTED;
+        }
+    }
+
+    btree->aux = trie->aux;
+    r = btree_remove(btree, rawkey);
+    if (r == BTREE_RESULT_FAIL) {
+        assert(0);
+        ret_result = HBTRIE_RESULT_FAIL;
+    }
+
+    return ret_result;
 }
 
 hbtrie_result hbtrie_remove(struct hbtrie *trie,
                             void *rawkey,
                             int rawkeylen)
 {
-    return _hbtrie_remove(trie, rawkey, rawkeylen, 0x0);
+    int nchunk = 1;
+    uint8_t *key = alca(uint8_t, nchunk * trie->chunksize);
+    int keylen;
+
+    keylen = _hbtrie_reform_key(trie, rawkey, rawkeylen, key);
+    return _hbtrie_remove(trie, key, keylen, 0x0);
 }
 
 hbtrie_result hbtrie_remove_partial(struct hbtrie *trie,
@@ -1586,149 +1411,6 @@ struct _key_item {
     struct list_elem le;
 };
 
-static void _hbtrie_extend_leaf_tree(struct hbtrie *trie,
-                                     struct list *btreelist,
-                                     struct btreelist_item *btreeitem,
-                                     void *pre_str,
-                                     size_t pre_str_len)
-{
-    struct list keys;
-    struct list_elem *e;
-    struct _key_item *item, *smallest = NULL;
-    struct btree_iterator it;
-    struct btree new_btree;
-    struct btree_meta meta;
-    struct hbtrie_meta hbmeta;
-    btree_result br;
-    void *prefix = NULL, *meta_value = NULL;
-    uint8_t *key_str = alca(uint8_t, HBTRIE_MAX_KEYLEN);
-    uint8_t *key_buf = alca(uint8_t, trie->chunksize);
-    uint8_t *value_buf = alca(uint8_t, trie->valuelen);
-    uint8_t *buf = alca(uint8_t, trie->btree_nodesize);
-    size_t keylen, minchunkno = 0, chunksize;
-
-    chunksize = trie->chunksize;
-
-    // fetch metadata
-    meta.data = buf;
-    meta.size = btree_read_meta(&btreeitem->btree, meta.data);
-    _hbtrie_fetch_meta(trie, meta.size, &hbmeta, meta.data);
-
-    // scan all keys
-    list_init(&keys);
-    memset(key_buf, 0, chunksize);
-    minchunkno = 0;
-
-    br = btree_iterator_init(&btreeitem->btree, &it, NULL);
-    while (br == BTREE_RESULT_SUCCESS) {
-        // get key
-        if ((br = btree_next(&it, key_buf, value_buf)) == BTREE_RESULT_FAIL) {
-            break;
-        }
-
-        _get_leaf_key(key_buf, key_str, &keylen);
-        _free_leaf_key(key_buf);
-
-        // insert into list
-        item = (struct _key_item *)malloc(sizeof(struct _key_item));
-
-        item->key = (void *)malloc(keylen);
-        item->keylen = keylen;
-        memcpy(item->key, key_str, keylen);
-
-        item->value = (void *)malloc(trie->valuelen);
-        memcpy(item->value, value_buf, trie->valuelen);
-
-        list_push_back(&keys, &item->le);
-
-        if (hbmeta.value == NULL) {
-            // check common prefix
-            if (prefix == NULL) {
-                // initialize
-                prefix = item->key;
-                minchunkno = _l2c(trie, item->keylen);
-            } else {
-                // update the length of common prefix
-                minchunkno = _hbtrie_find_diff_chunk(
-                    trie, prefix, item->key, 0,
-                    MIN(_l2c(trie, item->keylen), minchunkno));
-            }
-
-            // update smallest (shortest) key
-            if (smallest == NULL) {
-                smallest = item;
-            } else {
-                if (item->keylen < smallest->keylen)
-                    smallest = item;
-            }
-        }
-    }
-    btree_iterator_free(&it);
-
-    // construct new (non-leaf) b-tree
-    if (hbmeta.value) {
-        // insert tree's prefix into the list
-        item = (struct _key_item *)malloc(sizeof(struct _key_item));
-
-        item->key = NULL;
-        item->keylen = 0;
-
-        item->value = (void *)malloc(trie->valuelen);
-        memcpy(item->value, hbmeta.value, trie->valuelen);
-
-        list_push_back(&keys, &item->le);
-
-        meta_value = smallest = NULL;
-    } else {
-        if (smallest) {
-            if (minchunkno > 0 &&
-               (size_t) _get_nchunk_raw(trie, smallest->key, smallest->keylen) ==
-                minchunkno) {
-                meta_value = smallest->value;
-            } else {
-                smallest = NULL;
-            }
-        }
-    }
-    _hbtrie_store_meta(
-            trie, &meta.size, _get_chunkno(hbmeta.chunkno) + minchunkno,
-            HBMETA_NORMAL, prefix, minchunkno * chunksize, meta_value, buf);
-
-    btree_init(&new_btree, trie->btreeblk_handle, trie->btree_blk_ops,
-        trie->btree_kv_ops, trie->btree_nodesize, chunksize, trie->valuelen,
-        0x0, &meta);
-    new_btree.aux = trie->aux;
-
-    // reset BTREEITEM
-    btreeitem->btree = new_btree;
-    btreeitem->chunkno = _get_chunkno(hbmeta.chunkno) + minchunkno;
-    btreeitem->leaf = 0;
-
-    _hbtrie_btree_cascaded_update(trie, btreelist, pre_str, 1);
-
-    // insert all keys
-    memcpy(key_str, pre_str, pre_str_len);
-    e = list_begin(&keys);
-    while (e) {
-        item = _get_entry(e, struct _key_item, le);
-        if (item != smallest) {
-            if (item->keylen > 0) {
-                memcpy(key_str + pre_str_len, item->key, item->keylen);
-            }
-            hbtrie_insert(trie, key_str, pre_str_len + item->keylen,
-                item->value, value_buf);
-        }
-
-        e = list_remove(&keys, e);
-        if (item->key) {
-            free(item->key);
-        }
-        free(item->value);
-        free(item);
-    }
-
-}
-
 // suppose that VALUE and OLDVALUE_OUT are based on the same endian in hb+trie
 #define HBTRIE_PARTIAL_UPDATE (0x1)
 INLINE hbtrie_result _hbtrie_insert(struct hbtrie *trie,
@@ -1736,650 +1418,69 @@ INLINE hbtrie_result _hbtrie_insert(struct hbtrie *trie,
                                     void *value, void *oldvalue_out,
                                     uint8_t flag)
 {
-    /*
-    <insertion cases>
-    1. normal insert: there is no creation of new b-tree
-    2. replacing doc by new b-tree: a doc (which has same prefix) already exists
-        2-1. a new b-tree that has file offset to a doc in its metadata
-             is created, and the other doc is inserted into the tree
-        2-2. two docs are inserted into the new b-tree
-    3. create new b-tree between existing b-trees: when prefix mismatches
-    */
-
-    int nchunk;
     int keylen;
-    int prevchunkno, curchunkno;
-    int cpt_node = 0;
-    int leaf_cond = 0;
-    uint8_t *k = alca(uint8_t, trie->chunksize);
 
-    struct list btreelist;
-    //struct btree btree, btree_new;
-    struct btreelist_item *btreeitem, *btreeitem_new;
     hbtrie_result ret_result = HBTRIE_RESULT_SUCCESS;
     btree_result r;
-    struct btree_kv_ops *kv_ops;
 
-    struct hbtrie_meta hbmeta;
-    struct btree_meta meta;
-    hbmeta_opt opt;
-    hbtrie_cmp_func *void_cmp;
+    struct btree *btree = NULL;
+    struct btree btree_static;
 
-    nchunk = _get_nchunk_raw(trie, rawkey, rawkeylen);
-
-    uint8_t *key = alca(uint8_t, nchunk * trie->chunksize);
-    uint8_t *buf = alca(uint8_t, trie->btree_nodesize);
-    uint8_t *btree_value = alca(uint8_t, trie->valuelen);
-    void *chunk, *chunk_new;
-    bid_t bid_new, _bid;
-
-    meta.data = buf;
-    curchunkno = 0;
-    keylen = _hbtrie_reform_key(trie, rawkey, rawkeylen, key);
-    (void)keylen;
-
-    if (trie->map) { // custom cmp functions exist
-        if (!memcmp(trie->last_map_chunk, key, trie->chunksize)) {
-            // same custom function was used in the last call .. leaf b+tree
-            leaf_cond = 1;
-        } else {
-            // get cmp function corresponding to the key
-            void* user_param;
-            trie->map(key, (void *)trie, &void_cmp, &user_param);
-            if (void_cmp) {
-                // custom cmp function matches .. turn on leaf b+tree mode
-                leaf_cond = 1;
-                memcpy(trie->last_map_chunk, key, trie->chunksize);
-                // set aux for _fdb_custom_cmp_wrap()
-                trie->cmp_args.cmp_func = void_cmp;
-                trie->cmp_args.user_param = user_param;
-                trie->aux = &trie->cmp_args;
-            }
-        }
+    keylen = rawkeylen;
+    if (keylen != 8) {
+        fprintf(stderr, "Invalid keylen\n");
+        assert(0);
     }
 
-    list_init(&btreelist);
-    // btreeitem for root btree
-    btreeitem = (struct btreelist_item*)
-                mempool_alloc(sizeof(struct btreelist_item));
-    list_push_back(&btreelist, &btreeitem->e);
+    auto bhandle = (struct btreeblk_handle*)trie->btreeblk_handle;
 
+    btree = &btree_static;
     if (trie->root_bid == BLK_NOT_FOUND) {
         // create root b-tree
-        _hbtrie_store_meta(trie, &meta.size, 0, HBMETA_NORMAL,
-                           NULL, 0, NULL, buf);
-        r = btree_init(&btreeitem->btree, trie->btreeblk_handle,
+        r = btree_init(btree, trie->btreeblk_handle,
                        trie->btree_blk_ops, trie->btree_kv_ops,
                        trie->btree_nodesize, trie->chunksize,
-                       trie->valuelen, 0x0, &meta);
+                       trie->valuelen, 0x0, NULL);
+        btree->aux = trie->aux;
         if (r != BTREE_RESULT_SUCCESS) {
+            assert(0);
             return HBTRIE_RESULT_FAIL;
         }
+
+        btreeblk_end(bhandle);
     } else {
         // read from root_bid
-        r = btree_init_from_bid(&btreeitem->btree, trie->btreeblk_handle,
+        r = btree_init_from_bid(btree, trie->btreeblk_handle,
                                 trie->btree_blk_ops, trie->btree_kv_ops,
                                 trie->btree_nodesize, trie->root_bid);
+        btree->aux = trie->aux;
         if (r != BTREE_RESULT_SUCCESS) {
+            assert(0);
             return HBTRIE_RESULT_FAIL;
         }
-        if (btreeitem->btree.ksize != trie->chunksize ||
-            btreeitem->btree.vsize != trie->valuelen) {
-            if (((trie->chunksize << 4) | trie->valuelen) == btreeitem->btree.ksize) {
+        if (btree->ksize != trie->chunksize || btree->vsize != trie->valuelen) {
+            if (((trie->chunksize << 4) | trie->valuelen) == btree->ksize) {
                 // this is an old meta format
                 return HBTRIE_RESULT_INDEX_VERSION_NOT_SUPPORTED;
             }
             // B+tree root node is corrupted.
+            assert(0);
             return HBTRIE_RESULT_INDEX_CORRUPTED;
         }
     }
-    btreeitem->btree.aux = trie->aux;
+
+    btree->aux = trie->aux;
 
     // set 'oldvalue_out' to 0xff..
     if (oldvalue_out) {
         memset(oldvalue_out, 0xff, trie->valuelen);
     }
-
-    // Allocate docrawkey, dockey on the heap just for windows
-    // as stack over flow issues are sometimes seen (because of
-    // smaller process stack size).
-    // TODO: Maintaining a simple global buffer pool and reusing
-    // it would be better than allocating space for every operation.
-#if defined(WIN32) || defined(_WIN32)
-    uint8_t *docrawkey = (uint8_t *) malloc(HBTRIE_MAX_KEYLEN);
-    uint8_t *dockey = (uint8_t *) malloc(HBTRIE_MAX_KEYLEN);
-#else
-    uint8_t *docrawkey = alca(uint8_t, HBTRIE_MAX_KEYLEN);
-    uint8_t *dockey = alca(uint8_t, HBTRIE_MAX_KEYLEN);
-#endif
-
-    while (curchunkno < nchunk) {
-        // get current chunk number
-        meta.size = btree_read_meta(&btreeitem->btree, meta.data);
-        _hbtrie_fetch_meta(trie, meta.size, &hbmeta, meta.data);
-        prevchunkno = curchunkno;
-        if (_is_leaf_btree(hbmeta.chunkno)) {
-            cpt_node = 1;
-            hbmeta.chunkno = _get_chunkno(hbmeta.chunkno);
-            btreeitem->btree.kv_ops = trie->btree_leaf_kv_ops;
-        }
-        btreeitem->chunkno = curchunkno = hbmeta.chunkno;
-
-        //3 check whether there is skipped prefix
-        if (curchunkno - prevchunkno > 1) {
-            // prefix comparison (find the first different chunk)
-            int diffchunkno = _hbtrie_find_diff_chunk(trie, hbmeta.prefix,
-                                  key + trie->chunksize * (prevchunkno+1),
-                                  0, curchunkno - (prevchunkno+1));
-            if (diffchunkno < curchunkno - (prevchunkno+1)) {
-                //3 3. create sub-tree between parent and child tree
-
-                // metadata (prefix) update in btreeitem->btree
-                int new_prefixlen = trie->chunksize *
-                                    (curchunkno - (prevchunkno+1) -
-                                        (diffchunkno+1));
-                // backup old prefix
-                int old_prefixlen = hbmeta.prefix_len;
-                uint8_t *old_prefix = alca(uint8_t, old_prefixlen);
-                memcpy(old_prefix, hbmeta.prefix, old_prefixlen);
-
-                if (new_prefixlen > 0) {
-                    uint8_t *new_prefix = alca(uint8_t, new_prefixlen);
-                    memcpy(new_prefix,
-                           (uint8_t*)hbmeta.prefix +
-                               trie->chunksize * (diffchunkno + 1),
-                           new_prefixlen);
-                    _hbtrie_store_meta(trie, &meta.size, curchunkno,
-                                       HBMETA_NORMAL, new_prefix,
-                                       new_prefixlen, hbmeta.value, buf);
-                } else {
-                    _hbtrie_store_meta(trie, &meta.size, curchunkno,
-                                       HBMETA_NORMAL, NULL, 0,
-                                       hbmeta.value, buf);
-                }
-                // update metadata for old b-tree
-                btree_update_meta(&btreeitem->btree, &meta);
-
-                // split prefix and create new sub-tree
-                _hbtrie_store_meta(trie, &meta.size,
-                                   prevchunkno + diffchunkno + 1,
-                                   HBMETA_NORMAL, old_prefix,
-                                   diffchunkno * trie->chunksize, NULL, buf);
-
-                // create new b-tree
-                btreeitem_new = (struct btreelist_item *)
-                                mempool_alloc(sizeof(struct btreelist_item));
-                btreeitem_new->chunkno = prevchunkno + diffchunkno + 1;
-                r = btree_init(&btreeitem_new->btree, trie->btreeblk_handle,
-                               trie->btree_blk_ops, trie->btree_kv_ops,
-                               trie->btree_nodesize, trie->chunksize,
-                               trie->valuelen, 0x0, &meta);
-                if (r != BTREE_RESULT_SUCCESS) {
-#if defined(WIN32) || defined(_WIN32)
-                    // Free heap memory that was allocated only for windows
-                    free(docrawkey);
-                    free(dockey);
-#endif
-                    return HBTRIE_RESULT_FAIL;
-                }
-                btreeitem_new->btree.aux = trie->aux;
-                list_insert_before(&btreelist, &btreeitem->e,
-                                   &btreeitem_new->e);
-
-                // insert chunk for 'key'
-                chunk_new = key + (prevchunkno + diffchunkno + 1) *
-                                  trie->chunksize;
-                r = btree_insert(&btreeitem_new->btree, chunk_new, value);
-                if (r == BTREE_RESULT_FAIL) {
-#if defined(WIN32) || defined(_WIN32)
-                    // Free heap memory that was allocated only for windows
-                    free(docrawkey);
-                    free(dockey);
-#endif
-                    return HBTRIE_RESULT_FAIL;
-                }
-                // insert chunk for existing btree
-                chunk_new = (uint8_t*)old_prefix + diffchunkno *
-                                                   trie->chunksize;
-                bid_new = btreeitem->btree.root_bid;
-                btreeitem_new->child_rootbid = bid_new;
-                // set MSB
-                _bid = _endian_encode(bid_new);
-                _hbtrie_set_msb(trie, (void*)&_bid);
-                r = btree_insert(&btreeitem_new->btree,
-                                 chunk_new, (void*)&_bid);
-                if (r == BTREE_RESULT_FAIL) {
-#if defined(WIN32) || defined(_WIN32)
-                    // Free heap memory that was allocated only for windows
-                    free(docrawkey);
-                    free(dockey);
-#endif
-                    return HBTRIE_RESULT_FAIL;
-                }
-
-                break;
-            }
-        }
-
-        //3 search b-tree using current chunk
-        if ((cpt_node && rawkeylen == curchunkno * trie->chunksize) ||
-            (!cpt_node && nchunk == curchunkno)) {
-            // KEY is exactly same as tree's prefix .. insert into metasection
-            _hbtrie_store_meta(trie, &meta.size, curchunkno,
-                               (cpt_node)?(HBMETA_LEAF):(HBMETA_NORMAL),
-                               hbmeta.prefix,
-                               (curchunkno-prevchunkno - 1) * trie->chunksize,
-                               value, buf);
-            btree_update_meta(&btreeitem->btree, &meta);
-            break;
-        } else {
-            chunk = key + curchunkno*trie->chunksize;
-            if (cpt_node) {
-                // leaf b-tree
-                _set_leaf_key(k, chunk,
-                              rawkeylen - curchunkno*trie->chunksize);
-                r = btree_find(&btreeitem->btree, k, btree_value);
-                _free_leaf_key(k);
-            } else {
-                r = btree_find(&btreeitem->btree, chunk, btree_value);
-            }
-        }
-
-        if (r == BTREE_RESULT_FAIL) {
-            //3 1. normal insert: same chunk does not exist -> just insert
-            if (flag & HBTRIE_PARTIAL_UPDATE) {
-                // partial update doesn't allow inserting a new key
-                ret_result = HBTRIE_RESULT_FAIL;
-                break; // while loop
-            }
-
-            if (cpt_node) {
-                // leaf b-tree
-                _set_leaf_key(k, chunk,
-                              rawkeylen - curchunkno*trie->chunksize);
-                r = btree_insert(&btreeitem->btree, k, value);
-                if (r == BTREE_RESULT_FAIL) {
-                    _free_leaf_key(k);
-                    ret_result = HBTRIE_RESULT_FAIL;
-                    break; // while loop
-                }
-                _free_leaf_key(k);
-
-                if (btreeitem->btree.height > trie->leaf_height_limit) {
-                    // height growth .. extend!
-                    _hbtrie_extend_leaf_tree(trie, &btreelist, btreeitem,
-                        key, curchunkno * trie->chunksize);
-#if defined(WIN32) || defined(_WIN32)
-                    // Free heap memory that was allocated only for windows
-                    free(docrawkey);
-                    free(dockey);
-#endif
-                    return ret_result;
-                }
-            } else {
-                r = btree_insert(&btreeitem->btree, chunk, value);
-                if (r == BTREE_RESULT_FAIL) {
-                    ret_result = HBTRIE_RESULT_FAIL;
-                }
-            }
-            break; // while loop
-        }
-
-        // same chunk already exists
-        if (flag & HBTRIE_PARTIAL_UPDATE &&
-            curchunkno + 1 == nchunk - 1) {
-            // partial update mode & the last meaningful chunk
-            // update the local btree value
-            if (oldvalue_out) {
-                memcpy(oldvalue_out, btree_value, trie->valuelen);
-            }
-            // assume that always normal b-tree
-            r = btree_insert(&btreeitem->btree, chunk, value);
-            if (r == BTREE_RESULT_FAIL) {
-                ret_result = HBTRIE_RESULT_FAIL;
-            } else {
-                ret_result = HBTRIE_RESULT_SUCCESS;
-            }
-            break;
-        }
-
-        // check whether the value points to sub-tree or document
-        // check MSB
-        if (_hbtrie_is_msb_set(trie, btree_value)) {
-            // this is BID of b-tree node (by clearing MSB)
-            _hbtrie_clear_msb(trie, btree_value);
-            bid_new = trie->btree_kv_ops->value2bid(btree_value);
-            bid_new = _endian_decode(bid_new);
-            btreeitem->child_rootbid = bid_new;
-            //3 traverse to the sub-tree
-            // fetch sub-tree
-            btreeitem = (struct btreelist_item*)
-                        mempool_alloc(sizeof(struct btreelist_item));
-
-            r = btree_init_from_bid(&btreeitem->btree,
-                                    trie->btreeblk_handle,
-                                    trie->btree_blk_ops,
-                                    trie->btree_kv_ops,
-                                    trie->btree_nodesize, bid_new);
-            if (r == BTREE_RESULT_FAIL) {
-                ret_result = HBTRIE_RESULT_FAIL;
-            }
-            btreeitem->btree.aux = trie->aux;
-            list_push_back(&btreelist, &btreeitem->e);
-            continue;
-        }
-
-        // this is offset of document (as it is)
-        // create new sub-tree
-
-        uint32_t docrawkeylen, dockeylen, minrawkeylen;
-        uint64_t offset;
-        int docnchunk, minchunkno, newchunkno, diffchunkno;
-
-        // get offset value from btree_value
-        offset = trie->btree_kv_ops->value2bid(btree_value);
-
-        // read entire key
-        docrawkeylen = trie->readkey(trie->doc_handle, offset, docrawkey);
-        dockeylen = _hbtrie_reform_key(trie, docrawkey, docrawkeylen, dockey);
-
-        // find first different chunk
-        docnchunk = _get_nchunk(trie, dockey, dockeylen);
-
-        if (trie->flag & HBTRIE_FLAG_COMPACT || leaf_cond) {
-            // optimization mode
-            // Note: custom cmp function doesn't support key
-            //       longer than a block size.
-
-            // newchunkno doesn't matter to leaf B+tree,
-            // since leaf B+tree can't create sub-tree.
-            newchunkno = curchunkno+1;
-            minchunkno = MIN(_l2c(trie, rawkeylen),
-                             _l2c(trie, (int)docrawkeylen));
-            minrawkeylen = MIN(rawkeylen, (int)docrawkeylen);
-
-            if (curchunkno == 0) {
-                // root B+tree
-                diffchunkno = _hbtrie_find_diff_chunk(trie, rawkey, docrawkey,
-                    curchunkno, minchunkno -
-                                ((minrawkeylen%trie->chunksize == 0)?(0):(1)));
-                if (rawkeylen == (int)docrawkeylen && diffchunkno+1 == minchunkno) {
-                    if (!memcmp(rawkey, docrawkey, rawkeylen)) {
-                        // same key
-                        diffchunkno = minchunkno;
-                    }
-                }
-            } else {
-                // diffchunkno also doesn't matter to leaf B+tree,
-                // since leaf B+tree is not based on a lexicographical key order.
-                // Hence, we set diffchunkno to minchunkno iff two keys are
-                // identified as the same key by the custom compare function.
-                // Otherwise, diffchunkno is always set to curchunkno.
-                uint8_t *k_doc = alca(uint8_t, trie->chunksize);
-                _set_leaf_key(k, chunk,
-                              rawkeylen - curchunkno*trie->chunksize);
-                _set_leaf_key(k_doc, (uint8_t*)docrawkey + curchunkno*trie->chunksize,
-                              docrawkeylen - curchunkno*trie->chunksize);
-                if (trie->btree_leaf_kv_ops->cmp(k, k_doc, trie->aux) == 0) {
-                    // same key
-                    diffchunkno = minchunkno;
-                    docnchunk = nchunk;
-                } else {
-                    // different key
-                    diffchunkno = curchunkno;
-                }
-                _free_leaf_key(k);
-                _free_leaf_key(k_doc);
-            }
-            opt = HBMETA_LEAF;
-            kv_ops = trie->btree_leaf_kv_ops;
-        } else {
-            // original mode
-            minchunkno = MIN(nchunk, docnchunk);
-            newchunkno = diffchunkno =
-                _hbtrie_find_diff_chunk(trie, key, dockey,
-                                        curchunkno, minchunkno);
-            opt = HBMETA_NORMAL;
-            kv_ops = trie->btree_kv_ops;
-        }
-
-        // one key is substring of the other key
-        if (minchunkno == diffchunkno && docnchunk == nchunk) {
-            //3 same key!! .. update the value
-            if (oldvalue_out) {
-                memcpy(oldvalue_out, btree_value, trie->valuelen);
-            }
-            if (cpt_node) {
-                // leaf b-tree
-                _set_leaf_key(k, chunk,
-                              rawkeylen - curchunkno*trie->chunksize);
-                r = btree_insert(&btreeitem->btree, k, value);
-                _free_leaf_key(k);
-            } else {
-                // normal b-tree
-                r = btree_insert(&btreeitem->btree, chunk, value);
-            }
-            if (r == BTREE_RESULT_FAIL) {
-                ret_result = HBTRIE_RESULT_FAIL;
-            } else {
-                ret_result = HBTRIE_RESULT_SUCCESS;
-            }
-
-            break;
-        }
-
-        // different key
-        while (trie->btree_nodesize > HBTRIE_HEADROOM &&
-               (newchunkno - curchunkno) * trie->chunksize >
-                   (int)trie->btree_nodesize - HBTRIE_HEADROOM) {
-            // prefix is too long .. we have to split it
-            fdb_assert(opt == HBMETA_NORMAL, opt, trie);
-            int midchunkno;
-            midchunkno = curchunkno +
-                        (trie->btree_nodesize - HBTRIE_HEADROOM) /
-                            trie->chunksize;
-            _hbtrie_store_meta(trie, &meta.size, midchunkno, opt,
-                               key + trie->chunksize * (curchunkno+1),
-                               (midchunkno - (curchunkno+1)) *
-                                   trie->chunksize,
-                               NULL, buf);
-
-            btreeitem_new = (struct btreelist_item *)
-                            mempool_alloc(sizeof(struct btreelist_item));
-            btreeitem_new->chunkno = midchunkno;
-            r = btree_init(&btreeitem_new->btree,
-                           trie->btreeblk_handle,
-                           trie->btree_blk_ops, kv_ops,
-                           trie->btree_nodesize, trie->chunksize,
-                           trie->valuelen, 0x0, &meta);
-            if (r == BTREE_RESULT_FAIL) {
-#if defined(WIN32) || defined(_WIN32)
-                // Free heap memory that was allocated only for windows
-                free(docrawkey);
-                free(dockey);
-#endif
-                return HBTRIE_RESULT_FAIL;
-            }
-
-            btreeitem_new->btree.aux = trie->aux;
-            btreeitem_new->child_rootbid = BLK_NOT_FOUND;
-            list_push_back(&btreelist, &btreeitem_new->e);
-
-            // insert new btree's bid into the previous btree
-            bid_new = btreeitem_new->btree.root_bid;
-            btreeitem->child_rootbid = bid_new;
-            _bid = _endian_encode(bid_new);
-            _hbtrie_set_msb(trie, (void *)&_bid);
-            r = btree_insert(&btreeitem->btree, chunk, &_bid);
-            if (r == BTREE_RESULT_FAIL) {
-                ret_result = HBTRIE_RESULT_FAIL;
-                break;
-            }
-
-            // switch & go to the next tree
-            chunk = (uint8_t*)key +
-                    midchunkno * trie->chunksize;
-            curchunkno = midchunkno;
-            btreeitem = btreeitem_new;
-        } // 2nd while
-
-        if (ret_result != HBTRIE_RESULT_SUCCESS) {
-            break;
-        }
-
-        if (minchunkno == diffchunkno && minchunkno == newchunkno) {
-            //3 2-1. create sub-tree
-            // that containing file offset of one doc (sub-string)
-            // in its meta section, and insert the other doc
-            // (super-string) into the tree
-
-            void *key_long, *value_long;
-            void *key_short, *value_short;
-            size_t nchunk_long, rawkeylen_long;
-
-            if (docnchunk < nchunk) {
-                // dockey is substring of key
-                key_short = dockey;
-                value_short = btree_value;
-
-                key_long = key;
-                value_long = value;
-
-                nchunk_long = nchunk;
-                rawkeylen_long = rawkeylen;
-            } else {
-                // key is substring of dockey
-                key_short = key;
-                value_short = value;
-
-                key_long = dockey;
-                value_long = btree_value;
-
-                nchunk_long = docnchunk;
-                rawkeylen_long = docrawkeylen;
-            }
-            (void)key_short;
-            (void)nchunk_long;
-
-            _hbtrie_store_meta(trie, &meta.size, newchunkno, opt,
-                               key + trie->chunksize * (curchunkno+1),
-                               (newchunkno - (curchunkno+1)) *
-                                   trie->chunksize,
-                               value_short, buf);
-
-            btreeitem_new = (struct btreelist_item *)
-                            mempool_alloc(sizeof(struct btreelist_item));
-            btreeitem_new->chunkno = newchunkno;
-            r = btree_init(&btreeitem_new->btree,
-                           trie->btreeblk_handle,
-                           trie->btree_blk_ops, kv_ops,
-                           trie->btree_nodesize, trie->chunksize,
-                           trie->valuelen, 0x0, &meta);
-            if (r == BTREE_RESULT_FAIL) {
-                ret_result = HBTRIE_RESULT_FAIL;
-                break;
-            }
-            btreeitem_new->btree.aux = trie->aux;
-
-            list_push_back(&btreelist, &btreeitem_new->e);
-
-            chunk_new = (uint8_t*)key_long +
-                        newchunkno * trie->chunksize;
-
-            if (opt == HBMETA_LEAF) {
-                // optimization mode
-                _set_leaf_key(k, chunk_new, rawkeylen_long -
-                                  newchunkno*trie->chunksize);
-                r = btree_insert(&btreeitem_new->btree, k, value_long);
-                if (r == BTREE_RESULT_FAIL) {
-                    ret_result = HBTRIE_RESULT_FAIL;
-                }
-                _free_leaf_key(k);
-            } else {
-                // normal mode
-                r = btree_insert(&btreeitem_new->btree,
-                                 chunk_new, value_long);
-                if (r == BTREE_RESULT_FAIL) {
-                    ret_result = HBTRIE_RESULT_FAIL;
-                }
-            }
-
-        } else {
-            //3 2-2. create sub-tree
-            // and insert two docs into it
-            _hbtrie_store_meta(trie, &meta.size, newchunkno, opt,
-                               key + trie->chunksize * (curchunkno+1),
-                               (newchunkno - (curchunkno+1)) * trie->chunksize,
-                               NULL, buf);
-
-            btreeitem_new = (struct btreelist_item *)
-                            mempool_alloc(sizeof(struct btreelist_item));
-            btreeitem_new->chunkno = newchunkno;
-            r = btree_init(&btreeitem_new->btree, trie->btreeblk_handle,
-                           trie->btree_blk_ops, kv_ops,
-                           trie->btree_nodesize, trie->chunksize,
-                           trie->valuelen, 0x0, &meta);
-            if (r == BTREE_RESULT_FAIL) {
-                ret_result = HBTRIE_RESULT_FAIL;
-            }
-            btreeitem_new->btree.aux = trie->aux;
-
-            list_push_back(&btreelist, &btreeitem_new->e);
-            // insert KEY
-            chunk_new = key + newchunkno * trie->chunksize;
-            if (opt == HBMETA_LEAF) {
-                // optimization mode
-                _set_leaf_key(k, chunk_new,
-                              rawkeylen - newchunkno*trie->chunksize);
-                r = btree_insert(&btreeitem_new->btree, k, value);
-                _free_leaf_key(k);
-            } else {
-                r = btree_insert(&btreeitem_new->btree, chunk_new, value);
-            }
-            if (r == BTREE_RESULT_FAIL) {
-                ret_result = HBTRIE_RESULT_FAIL;
-            }
-
-            // insert the original DOCKEY
-            chunk_new = dockey + newchunkno * trie->chunksize;
-            if (opt == HBMETA_LEAF) {
-                // optimization mode
-                _set_leaf_key(k, chunk_new,
-                              docrawkeylen - newchunkno*trie->chunksize);
-                r = btree_insert(&btreeitem_new->btree, k, btree_value);
-                _free_leaf_key(k);
-            } else {
-                r = btree_insert(&btreeitem_new->btree,
-                                 chunk_new, btree_value);
-            }
-            if (r == BTREE_RESULT_FAIL) {
-                ret_result = HBTRIE_RESULT_FAIL;
-            }
-        }
-
-        // update previous (parent) b-tree
-        bid_new = btreeitem_new->btree.root_bid;
-        btreeitem->child_rootbid = bid_new;
-
-        // set MSB
-        _bid = _endian_encode(bid_new);
-        _hbtrie_set_msb(trie, (void *)&_bid);
-        // ASSUMPTION: parent b-tree always MUST be non-leaf b-tree
-        r = btree_insert(&btreeitem->btree, chunk, (void*)&_bid);
-        if (r == BTREE_RESULT_FAIL) {
-            ret_result = HBTRIE_RESULT_FAIL;
-        }
-
-        break;
-    } // 1st while
-
-#if defined(WIN32) || defined(_WIN32)
-    // Free heap memory that was allocated only for windows
-    free(docrawkey);
-    free(dockey);
-#endif
-
-    _hbtrie_btree_cascaded_update(trie, &btreelist, key, 1);
+    r = btree_insert_get_old(btree, rawkey, value, oldvalue_out);
+    if (r == BTREE_RESULT_FAIL) {
+        assert(0);
+        ret_result = HBTRIE_RESULT_FAIL;
+    }
+    trie->root_bid = btree->root_bid;
 
     return ret_result;
 }
@@ -2387,12 +1488,18 @@ INLINE hbtrie_result _hbtrie_insert(struct hbtrie *trie,
 hbtrie_result hbtrie_insert(struct hbtrie *trie,
                             void *rawkey, int rawkeylen,
                             void *value, void *oldvalue_out) {
-    return _hbtrie_insert(trie, rawkey, rawkeylen, value, oldvalue_out, 0x0);
+    int nchunk = 1;
+    uint8_t *key = alca(uint8_t, nchunk * trie->chunksize);
+    int keylen;
+
+    keylen = _hbtrie_reform_key(trie, rawkey, rawkeylen, key);
+    return _hbtrie_insert(trie, key, keylen, value, oldvalue_out, 0x0);
 }
 
 hbtrie_result hbtrie_insert_partial(struct hbtrie *trie,
                                     void *rawkey, int rawkeylen,
                                     void *value, void *oldvalue_out) {
+    assert(0);
     return _hbtrie_insert(trie, rawkey, rawkeylen,
                           value, oldvalue_out, HBTRIE_PARTIAL_UPDATE);
 }

@@ -8,6 +8,7 @@
  * modified by Jung-Sang Ahn in 2013.
  */
 
+#include <assert.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -323,7 +324,7 @@ uint32_t crc32_8(const void* data, size_t len, uint32_t prev_value)
 {
     uint32_t *cur = (uint32_t*) data;
     uint32_t crc = ~prev_value;
-
+    
     while (len >= 8) {
 #ifdef _BIG_ENDIAN
         uint32_t one = *cur++ ^ bitswap32(crc);

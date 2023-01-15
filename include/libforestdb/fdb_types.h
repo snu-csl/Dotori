@@ -31,10 +31,7 @@
 #endif
 #endif
 
-/**
- * Maximum key length supported.
- */
-#define FDB_MAX_KEYLEN (65408) // 2^16 - 64*2 (64: max chunk size)
+#define FDB_MAX_KEYLEN (8) // Dotori key size
 /**
  * Maximum metadata length supported.
  */
@@ -42,7 +39,7 @@
 /**
  * Maximum value length supported.
  */
-#define FDB_MAX_BODYLEN (4294967295UL) // 2^32 - 1
+#define FDB_MAX_BODYLEN (2097152UL) // KVSSD maximum value size
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,7 +89,13 @@ enum {
      * Manually flush WAL entries even though it doesn't
      * reach the configured threshold
      */
-    FDB_COMMIT_MANUAL_WAL_FLUSH = 0x01
+    FDB_COMMIT_MANUAL_WAL_FLUSH = 0x01,
+    /**
+     * Manually flush WAL entries even though it doesn't
+     * reach the configured threshold
+     * and repack all bnode with logs
+     */
+    FDB_COMMIT_MANUAL_WAL_FLUSH_WITH_REPACK = 0x02
 };
 
 /**
@@ -197,6 +200,10 @@ typedef struct fdb_doc_struct {
      * Sequence number assigned to a doc.
      */
     fdb_seqnum_t seqnum;
+    /**
+     * Version number assigned to a doc.
+     */
+    uint64_t vernum;
     /**
      * Offset to the doc (header + key + metadata + body) on disk.
      */
@@ -331,6 +338,7 @@ typedef struct {
      * 128KB. This is a global config that is used across all ForestDB files.
      */
     uint32_t blocksize;
+    uint32_t index_blocksize;
     /**
      * Buffer cache size in bytes. If the size is set to zero, then the buffer
      * cache is disabled. This is a global config that is used across all
@@ -342,6 +350,8 @@ typedef struct {
      * This is a local config to each ForestDB file.
      */
     uint64_t wal_threshold;
+    uint64_t max_log_threshold;
+    int split_threshold;
     /**
      * Flag to enable flushing the WAL whenever it reaches its threshold size.
      * This reduces memory usage when a lot of data is written before a commit.
@@ -549,6 +559,121 @@ typedef struct {
      * If true, blocks containing actual document will not be cached.
      */
     bool do_not_cache_doc_blocks;
+    
+    /**
+     * If true, using a KVSSD instead of a block SSD.
+     */
+    bool kvssd;
+
+    char* kvssd_dev_path;
+
+    bool logging;
+
+    /**
+     *  Location of the emulator file for the KVSSD emulator
+     */
+
+    char* kvssd_emu_config_file;
+    
+    /**
+     * Size of the separate key-value pair data cache, if enabled
+     */
+    uint64_t kv_cache_size;
+    
+    /**
+     * Cache writes or just reads in the KV data cache
+     */
+    bool kv_cache_doc_writes;
+
+    /**
+     * Largest value the KVSSD can handle in a single write
+     */
+    uint32_t kvssd_max_value_size;
+
+    /**
+     * Asynchronous background WAL preload and flush or not
+     */
+
+    uint32_t background_wal_preload;
+
+    /**
+     * Pause WAL flushes to wait for old offsets to be preloaded
+     */
+
+    bool wal_flush_preloading;
+
+    /**
+     * Use the (write) downtime during a WAL flush to delete stale
+     * entries in ForestKV
+    */
+
+    bool delete_during_wal_flush;
+
+    /*
+     * Trim the on-disk and in-memory OAK-Tree logs
+     * after N MB. 0 means don't trim the logs at
+     * a certain size, but they may still be trimmed
+     * via large and cold log deletion.
+     */
+
+    uint64_t log_trim_mb;
+
+    /*
+     * Rewrite the data in logs that cross a certain
+     * time threshold between when they were first written and now.
+     * Removes stale updates inside the logs. 0 means don't
+     * rewrite cold logs. Time in seconds;
+     */
+
+    uint64_t cold_log_threshold;
+
+    /*
+     * Scan for cold logs every N commits
+     */
+
+    uint32_t cold_log_scan_interval;
+
+    /*
+     * Stale data threshold in percent used to trigger log trimming
+     */
+
+    uint64_t log_trim_threshold;
+
+    /*
+     * On close, persist all of the index nodes and delete the log.
+     * If false, tree will have to be rebuilt from logs on restart.
+     * Used for testing recovery.
+     */
+
+    bool write_index_on_close;
+
+    /*
+     * The maximum amount of logs that can exist for a certain node
+     * before they're rewritten into one log
+     */
+
+    uint32_t max_logs_per_node;
+
+    /*
+     * Number of threads serving AIO requests
+     */
+
+    uint32_t num_aio_workers;
+    uint32_t max_outstanding;
+
+    /*
+     * Run deletion routine every N seconds
+     */
+
+    uint16_t deletion_interval;
+
+    uint32_t kvssd_retrieve_length;
+
+    /*
+     * When flushing the WAL, perform index node reads asynchronously.
+     */
+
+    uint16_t async_wal_flushes;
 } fdb_config;
 
 typedef struct {
@@ -638,6 +763,12 @@ enum {
 typedef struct _fdb_iterator fdb_iterator;
 
 /**
+ * Opaque reference to ForestDB iterator structure definition, which is exposed
+ * in public APIs.
+ */
+typedef struct _fdb_kvssd_iterator fdb_iterator_kvssd;
+
+/**
  * Using off_t turned out to be a real challenge. On "unix-like" systems
  * its size is set by a combination of #defines like: _LARGE_FILE,
  * _FILE_OFFSET_BITS and/or _LARGEFILE_SOURCE etc. The interesting
@@ -693,6 +824,14 @@ typedef struct {
      * Revision number of Superblock's bitmap.
      */
     uint64_t sb_bmp_revnum;
+    /*
+     * Write amplification from Dotori (does not
+     * include device write amplification)
+     */
+    double app_write_amp;
+
+    uint64_t user_data;
+    uint64_t data_in_kvssd;
 } fdb_file_info;
 
 /**
@@ -861,6 +1000,16 @@ typedef struct {
      */
     fdb_kvs_commit_marker_t *kvs_markers;
 } fdb_snapshot_info_t;
+
+typedef void (*internal_fdb_async_get_cb_fn)(struct async_read_ctx_t *ctx);
+typedef void (*user_fdb_async_get_cb_fn)(fdb_kvs_handle *handle, fdb_doc *doc,
+                                         void* args, int rderrno);
+typedef void (*user_fdb_async_get_cb_fn_nodoc)(fdb_kvs_handle *handle, 
+                                               void* key, uint16_t klen,
+                                               void* val, uint32_t vlen,
+                                               void* args, int rderrno);
+typedef void (*docio_cb_fn)(struct async_read_ctx_t *ctx);
+typedef void (*hbtrie_find_cb_fn)(struct hbtrie_find_ctx_t *ctx);
 
 #ifdef __cplusplus
 }

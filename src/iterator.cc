@@ -32,6 +32,7 @@
 #include "internal_types.h"
 #include "btree_var_kv_ops.h"
 #include "timing.h"
+#include "kv_data_cache.h"
 
 #include "memleak.h"
 
@@ -582,6 +583,14 @@ start:
     return FDB_RESULT_SUCCESS;
 }
 
+typedef uint16_t chunkno_t;
+struct btreeit_item {
+    struct btree_iterator btree_it;
+    chunkno_t chunkno;
+    struct list_elem le;
+    uint8_t leaf;
+};
+
 static fdb_status _fdb_iterator_next(fdb_iterator *iterator)
 {
     int cmp;
@@ -591,6 +600,9 @@ static fdb_status _fdb_iterator_next(fdb_iterator *iterator)
     hbtrie_result hr = HBTRIE_RESULT_SUCCESS;
     struct docio_handle *dhandle;
     struct wal_item *snap_item = NULL;
+    struct btree btree;
+    struct hbtrie *trie;
+    btree_result br;
 
     if (iterator->direction != FDB_ITR_FORWARD) {
         iterator->_offset = BLK_NOT_FOUND; // need to re-examine Trie/trees
@@ -616,6 +628,7 @@ static fdb_status _fdb_iterator_next(fdb_iterator *iterator)
 start:
     key = iterator->_key;
     dhandle = iterator->handle->dhandle;
+    trie = &iterator->hbtrie_iterator->trie;
 
     // retrieve from hb-trie
     if (iterator->_offset == BLK_NOT_FOUND) {
@@ -623,36 +636,64 @@ start:
         // get next key from hb-trie (or idtree)
         struct docio_object _doc;
         // Move Main index Cursor forward...
-        int64_t _offset;
         do {
-            hr = hbtrie_next(iterator->hbtrie_iterator, key,
-                             &iterator->_keylen, (void*)&iterator->_offset);
-            btreeblk_end(iterator->handle->bhandle);
-            iterator->_offset = _endian_decode(iterator->_offset);
-            if (!(iterator->opt & FDB_ITR_NO_DELETES) ||
-                  hr != HBTRIE_RESULT_SUCCESS) {
-                break;
-            }
-            // deletion check
-            memset(&_doc, 0x0, sizeof(struct docio_object));
-            _offset = docio_read_doc_key_meta(dhandle, iterator->_offset, &_doc,
-                                              true);
-            if (_offset <= 0) { // read fail
-                continue; // get next doc
-            }
-            if (_doc.length.flag & DOCIO_DELETED) { // deleted doc
+            struct list_elem *e = list_begin(&iterator->hbtrie_iterator->btreeit_list);
+            struct btreeit_item *item = NULL;
+            if (e) item = _get_entry(e, struct btreeit_item, le);
+            uint64_t _offset;
+
+            if (item == NULL && trie->root_bid != BLK_NOT_FOUND) {
+                // this happens only when first call
+                // create iterator for root b-tree
+                btree_init_from_bid(&btree, iterator->hbtrie_iterator->trie.btreeblk_handle, 
+                                    trie->btree_blk_ops, trie->btree_kv_ops,
+                                    trie->btree_nodesize, trie->root_bid);
+                btree.aux = trie->aux;
+
+                item = (struct btreeit_item *)mempool_alloc(sizeof(struct btreeit_item));
+                item->chunkno = 0;
+                item->leaf = 0;
+
+                br = btree_iterator_init(&btree, &item->btree_it, iterator->start_key);
+                if (br == BTREE_RESULT_FAIL) assert(0);
+
+                list_push_back(&iterator->hbtrie_iterator->btreeit_list, &item->le);
+            } 
+            
+            if(item != NULL) {
+                btree_next(&item->btree_it, key, (void*)&iterator->_offset);
+                btreeblk_end(iterator->handle->bhandle);
+                iterator->_offset = _endian_decode(iterator->_offset);
+                if (!(iterator->opt & FDB_ITR_NO_DELETES) ||
+                        hr != HBTRIE_RESULT_SUCCESS) {
+                    break;
+                }
+                // deletion check
+                memset(&_doc, 0x0, sizeof(struct docio_object));
+                _offset = docio_read_doc_key_meta(dhandle, iterator->_offset, &_doc,
+                        true);
+                if (_offset <= 0) { // read fail
+                    continue; // get next doc
+                }
+                if (_doc.length.flag & DOCIO_DELETED) { // deleted doc
+                    free(_doc.key);
+                    free(_doc.meta);
+                    continue; // get next doc
+                }
                 free(_doc.key);
                 free(_doc.meta);
-                continue; // get next doc
+                hr = HBTRIE_RESULT_SUCCESS;
+                break;
+            } else {
+                hr = HBTRIE_RESULT_FAIL;
+                break;
             }
-            free(_doc.key);
-            free(_doc.meta);
-            break;
         } while (1);
     }
     if (hr == HBTRIE_RESULT_INDEX_CORRUPTED) return FDB_RESULT_FILE_CORRUPTION;
 
     keylen = iterator->_keylen;
+    keylen = 8;
     offset = iterator->_offset;
 
     if (hr != HBTRIE_RESULT_SUCCESS && iterator->tree_cursor == NULL) {
@@ -2090,7 +2131,14 @@ fdb_status fdb_iterator_get(fdb_iterator *iterator, fdb_doc **doc)
     }
 
     int64_t _offset = docio_read_doc(dhandle, offset, &_doc, true);
-    if (_offset <= 0) {
+    if(dhandle->file->config->kvssd) {
+        if (_offset < 0) {
+            atomic_cas_uint8_t(&iterator->handle->handle_busy, 1, 0);
+            fdb_doc_free(*doc);
+            *doc = NULL;
+            return _offset < 0 ? (fdb_status) _offset : FDB_RESULT_KEY_NOT_FOUND;
+        } 
+    } else if (_offset <= 0) {
         atomic_cas_uint8_t(&iterator->handle->handle_busy, 1, 0);
         fdb_doc_free(*doc);
         *doc = NULL;

@@ -22,7 +22,6 @@
 
 #include "libforestdb/forestdb.h"
 #include "superblock.h"
-#include "staleblock.h"
 #include "btreeblock.h"
 #include "list.h"
 #include "fdb_internal.h"
@@ -758,7 +757,12 @@ void sb_return_reusable_blocks(fdb_kvs_handle *handle)
     uint64_t sb_bmp_size = atomic_get_uint64_t(&sb->bmp_size);
     for (cur = atomic_get_uint64_t(&sb->cur_alloc_bid); cur < sb_bmp_size; ++cur) {
         if (_is_bmp_set(sb->bmp, cur)) {
-            filemgr_add_stale_block(handle->file, cur, 1);
+            if(handle->file->config->kvssd) {
+                assert(0);
+                filemgr_add_stale_block_kvssd(handle->file, cur, 1);
+            } else {
+                filemgr_add_stale_block(handle->file, cur, 1);
+            }
         }
 
         if ((cur % 256) == 0 && cur > 0) {
@@ -803,7 +807,12 @@ void sb_return_reusable_blocks(fdb_kvs_handle *handle)
 
         for (cur = rsv->cur_alloc_bid; cur < rsv->bmp_size; ++cur) {
             if (_is_bmp_set(rsv->bmp, cur)) {
-                filemgr_add_stale_block(handle->file, cur, 1);
+                if(handle->file->config->kvssd) {
+                    assert(0);
+                    filemgr_add_stale_block_kvssd(handle->file, cur, 1);
+                } else {
+                    filemgr_add_stale_block(handle->file, cur, 1);
+                }
             }
 
             if ((cur % 256) == 0 && cur > 0) {
@@ -1347,8 +1356,14 @@ fdb_status sb_write(struct filemgr *file, size_t sb_no,
     // set block marker
     memset(buf + blocksize, BLK_MARKER_SB, BLK_MARKER_SIZE);
 
+
     // directly write a block bypassing block cache
-    r = file->ops->pwrite(file->fd, buf, real_blocksize, sb_no * real_blocksize);
+    if(file->config->kvssd) {
+        r = filemgr_write_blocks_kvssd(file, (void*) "@Super_Block", buf, 1, sb_no);
+    } else {
+        r = file->ops->pwrite(file->fd, buf, real_blocksize, sb_no * real_blocksize);
+    }
+
     if (r != real_blocksize) {
         char errno_msg[512];
         file->ops->get_errno_str(errno_msg, 512);
@@ -1358,6 +1373,7 @@ fdb_status sb_write(struct filemgr *file, size_t sb_no,
                 sb_no, errno_msg);
         return fs;
     }
+
 
     // increase superblock's revision number
     atomic_incr_uint64_t(&file->sb->revnum);
@@ -1391,7 +1407,8 @@ static fdb_status _sb_read_given_no(struct filemgr *file,
     offset = 0;
 
     // directly read a block bypassing block cache
-    r = file->ops->pread(file->fd, buf, real_blocksize, sb_no * real_blocksize);
+//    r = file->ops->pread(file->fd, buf, real_blocksize, sb_no * real_blocksize);
+    r = filemgr_read_block(file, (void*) "@Super_Block", buf, sb_no);
     if (r != real_blocksize) {
         char errno_msg[512];
         file->ops->get_errno_str(errno_msg, 512);
@@ -1689,9 +1706,14 @@ fdb_status sb_read_latest(struct filemgr *file,
 
     // set last commit position
     if (atomic_get_uint64_t(&file->sb->cur_alloc_bid) != BLK_NOT_FOUND) {
-        atomic_store_uint64_t(&file->last_commit,
-                              atomic_get_uint64_t(&file->sb->cur_alloc_bid) *
-                              file->config->blocksize);
+        if(file->config->kvssd) {
+            atomic_store_uint64_t(&file->last_commit,
+                                  atomic_get_uint64_t(&file->sb->cur_alloc_bid));
+        } else {
+            atomic_store_uint64_t(&file->last_commit,
+                                  atomic_get_uint64_t(&file->sb->cur_alloc_bid) *
+                                  file->config->blocksize);
+        }
     } else {
         // otherwise, last_commit == file->pos
         // (already set by filemgr_open() function)
@@ -1750,6 +1772,7 @@ fdb_status sb_init(struct filemgr *file, struct sb_config sconfig,
     size_t i;
     bid_t sb_bid;
     fdb_status fs;
+//    uint64_t vernum = 0;
 
     // exit if superblock already exists.
     if (file->sb) {
@@ -1762,22 +1785,28 @@ fdb_status sb_init(struct filemgr *file, struct sb_config sconfig,
 
     file->sb = (struct superblock*)calloc(1, sizeof(struct superblock));
     file->sb->config = (struct sb_config*)calloc(1, sizeof(struct sb_config));
-    file->version = ver_get_latest_magic();
+    if(file->config->kvssd) {
+        file->version = FILEMGR_MAGIC_003;
+    } else {
+        file->version = FILEMGR_MAGIC_002;
+    }
     _sb_init(file->sb, sconfig);
 
     // write initial superblocks
     for (i=0; i<file->sb->config->num_sb; ++i) {
         // allocate
-        sb_bid = filemgr_alloc(file, log_callback);
-        if (sb_bid != i) {
-            // other data was written during sb_write .. error
-            fs = FDB_RESULT_SB_RACE_CONDITION;
-            fdb_log(log_callback, FDB_LOG_ERROR, fs,
-                    "Other writer interfered during sb_write (number: %" _F64 ")",
-                    i);
-            free(file->sb->config);
-            free(file->sb);
-            return fs;
+        if(!file->config->kvssd) {
+            sb_bid = filemgr_alloc(file, log_callback);
+            if (sb_bid != i) {
+                // other data was written during sb_write .. error
+                fs = FDB_RESULT_SB_RACE_CONDITION;
+                fdb_log(log_callback, FDB_LOG_ERROR, fs,
+                        "Other writer interfered during sb_write (number: %" _F64 ")",
+                        i);
+                free(file->sb->config);
+                free(file->sb);
+                return fs;
+            }
         }
 
         fs = sb_write(file, i, log_callback);
@@ -1785,6 +1814,11 @@ fdb_status sb_init(struct filemgr *file, struct sb_config sconfig,
             return fs;
         }
     }
+    
+//    if(file->config->kvssd) {
+//        // set SB vernum
+//        filemgr_set_vernum(file, file->sb->config->num_sb);
+//    }
 
     return FDB_RESULT_SUCCESS;
 }

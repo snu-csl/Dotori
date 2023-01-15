@@ -1,0 +1,10 @@
+KVSSD
+
+This Software is originally developed by OpenMPDK.
+THIS SOFTWARE USE FOLLOWING OPEN SOURCE COMPONENTS
+1. kv_bench dynamically links to the kv_core.
+2. kv_core interacts with kernel_driver with Linux system calls and is dynamically linked to kv_bench.
+3. kv_driver is a stand-alone component and used by other components only 
+   through Linux system calls.
+
+Please see application/kvbench/LICENSE, PDK/core/LICENSE and PDK/driver/PCIe/kernel_driver/LICENSE.

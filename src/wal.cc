@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/time.h>
 
 #include "filemgr.h"
 #include "common.h"
@@ -28,7 +29,8 @@
 #include "fdb_internal.h"
 
 #include "memleak.h"
-
+#include "kv_data_cache.h"
+#include "kvssdmgr.h"
 
 #ifdef __DEBUG
 #ifndef __DEBUG_WAL
@@ -1632,6 +1634,25 @@ INLINE void _wal_restore_root_info(void *voidhandle,
     }
 }
 
+struct wal_item * _dupe_item(struct wal_item *item) {
+    struct wal_item *ret = (struct wal_item*) malloc(sizeof(wal_item));
+    
+    ret->header = (struct wal_item_header*)malloc(sizeof(struct wal_item_header));
+    ret->header->key = malloc(item->header->keylen);
+    memcpy(ret->header->key, item->header->key, item->header->keylen);
+    ret->header->keylen = item->header->keylen;
+    ret->txn = item->txn;       
+    ret->action = item->action;
+    ret->doc_size = item->doc_size;
+    ret->offset = item->offset;
+    ret->seqnum = item->seqnum;
+    ret->old_offset = item->old_offset;
+    // ret->flag = item->flag;
+    atomic_store_uint8_t(&ret->flag, atomic_get_uint8_t(&item->flag));
+
+    return ret;
+}
+
 static fdb_status _wal_flush(struct filemgr *file,
                              void *dbhandle,
                              wal_flush_func *flush_func,
@@ -1650,8 +1671,23 @@ static fdb_status _wal_flush(struct filemgr *file,
     struct fdb_root_info root_info;
     size_t i = 0;
     size_t num_shards = file->wal->num_shards;
-    bool do_sort = !filemgr_is_fully_resident(file);
+    bool do_sort;
+    uint32_t count = 0;
 
+    /*
+        ForestKV Modification
+        It doesn't seem that sorting will have any benefit, as there is no
+        fixed concept of logically sequential writes on the KVSSD
+    */
+
+    if(file->config->kvssd) {
+        do_sort = true;
+    } else {
+        do_sort = !filemgr_is_fully_resident(file);
+    }
+
+    struct timeval  tv1, tv2;
+    gettimeofday(&tv1, NULL);
     if (do_sort) {
         avl_init(tree, WAL_SORTED_FLUSH);
     } else {
@@ -1668,6 +1704,7 @@ static fdb_status _wal_flush(struct filemgr *file,
             a_next = avl_next(a);
             header = _get_entry(a, struct wal_item_header, avl_key);
             ee = list_end(&header->items);
+            
             while (ee) {
                 ee_prev = list_prev(ee);
                 item = _get_entry(ee, struct wal_item, list_elem);
@@ -1695,11 +1732,15 @@ static fdb_status _wal_flush(struct filemgr *file,
                         } else {
                             list_push_back(list_head, &item->list_elem_flush);
                         }
+
+                        count++;
                     } else {
-                        spin_unlock(&file->wal->key_shards[i].lock);
-                        item->old_offset = get_old_offset(dbhandle, item);
-                        spin_lock(&file->wal->key_shards[i].lock);
-                        if (item->old_offset == item->offset) {
+                        // spin_unlock(&file->wal->key_shards[i].lock);
+                        // item->old_offset = get_old_offset(dbhandle, item);
+                        // spin_lock(&file->wal->key_shards[i].lock);
+                        item->old_offset = BLK_NOT_FOUND;
+                        if (item->old_offset == item->offset &&
+                            item->old_offset != BLK_NOT_FOUND) {
                             // Sometimes if there are uncommitted transactional
                             // items along with flushed committed items when
                             // file was closed, wal_restore can end up inserting
@@ -1707,16 +1748,19 @@ static fdb_status _wal_flush(struct filemgr *file,
                             // We should not try to flush them back again
                             item->flag |= WAL_ITEM_FLUSHED_OUT;
                         }
-                        if (item->old_offset == 0 && // doc not in main index
-                            item->action == WAL_ACT_REMOVE) {// insert & delete
-                            item->old_offset = BLK_NOT_FOUND;
-                            item->flag |= WAL_ITEM_FLUSHED_OUT;
-                        }
+                        //if (item->old_offset == BLK_NOT_FOUND && // doc not in main index
+                        //    item->action == WAL_ACT_REMOVE) {// insert & delete
+                        //    item->old_offset = BLK_NOT_FOUND;
+                        //    item->flag |= WAL_ITEM_FLUSHED_OUT;
+                        //}
+
                         if (do_sort) {
                             avl_insert(tree, &item->avl_flush, _wal_flush_cmp);
                         } else {
                             list_push_back(list_head, &item->list_elem_flush);
                         }
+
+                        count++;
                         break; // only pick one item per key
                     }
                 }
@@ -1727,6 +1771,11 @@ static fdb_status _wal_flush(struct filemgr *file,
         spin_unlock(&file->wal->key_shards[i].lock);
     }
 
+    gettimeofday(&tv2, NULL);
+    double time_spent =  (double) (tv2.tv_usec - tv1.tv_usec) / 1000000 +
+                         (double) (tv2.tv_sec - tv1.tv_sec);
+    //printf("WAL flush part 1 %f seconds\n", time_spent);
+
     filemgr_set_io_inprog(file); // MB-16622:prevent parallel writes by flusher
     fdb_status fs = FDB_RESULT_SUCCESS;
     struct avl_tree stale_seqnum_list;
@@ -1734,6 +1783,8 @@ static fdb_status _wal_flush(struct filemgr *file,
     avl_init(&stale_seqnum_list, NULL);
     avl_init(&kvs_delta_stats, NULL);
 
+
+    gettimeofday(&tv1, NULL);
     // scan and flush entries in the avl-tree or list
     if (do_sort) {
         struct avl_node *a = avl_first(tree);
@@ -1766,6 +1817,13 @@ static fdb_status _wal_flush(struct filemgr *file,
             }
         }
     }
+
+    gettimeofday(&tv2, NULL);
+    time_spent =  (double) (tv2.tv_usec - tv1.tv_usec) / 1000000 +
+                         (double) (tv2.tv_sec - tv1.tv_sec);
+    //printf("\n\n\n\nWAL flush part 2 %f seconds\n\n\n", time_spent);
+
+    //printf("WAL FLUSHED %u ITEMS\n", count);
 
     // Remove all stale seq entries from the seq tree
     seq_purge_func(dbhandle, &stale_seqnum_list, &kvs_delta_stats);

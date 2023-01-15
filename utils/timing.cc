@@ -285,3 +285,37 @@ ts_nsec ts_diff(ts_nsec start, ts_nsec end)
     }
     return diff/1000;
 }
+
+/*
+    return a monotonically increasing value with microsecond frequency.
+*/
+ts_usec get_monotonic_ts_us() {
+    //ts_usec ts = 0;
+#if defined(WIN32)
+    /* GetTickCound64 gives us near 60years of ticks...*/
+    ts =  GetTickCount64() * 1000;  // TODO: this is not true high-res microseconds on windows
+#elif defined(__APPLE__)
+    long time = mach_absolute_time();
+
+    static mach_timebase_info_data_t timebase;
+    if (timebase.denom == 0) {
+      mach_timebase_info(&timebase);
+    }
+
+    ts = (double)time * timebase.numer / timebase.denom;
+    ts = ts / 1000;
+#elif defined(__linux__) || defined(__sun) || defined(__FreeBSD__)
+    /* Linux and Solaris can use clock_gettime */
+//    struct timespec tm;
+//    if (clock_gettime(CLOCK_REALTIME, &tm) == -1) {
+//        abort();
+//    }
+//    ts = tm.tv_nsec / 1000;
+    struct timeval tv;
+    gettimeofday(&tv,NULL);
+#else
+#error "Don't know how to build get_monotonic_ts"
+#endif
+
+    return 1000000 * tv.tv_sec + tv.tv_usec;
+}

@@ -60,6 +60,23 @@ LIBFDB_API
 fdb_config fdb_get_default_config(void);
 
 /**
+ * Get the default ForestDB config for the KVSSD.
+ * The general recommendation is to invoke this API to get the default configs
+ * and change some configs if necessary and then pass them to fdb_open APIs.
+ *
+ * @return fdb_config instance that contains the default configs.
+ */
+LIBFDB_API
+fdb_config fdb_get_default_config_kvssd(void);
+
+LIBFDB_API
+fdb_status fdb_reset_kvssd(fdb_kvs_handle* handle,
+                           const char *dev_path, const char* keyspace_name);
+
+LIBFDB_API
+fdb_status fdb_force_repack(fdb_kvs_handle *handle);
+
+/**
  * Get the default ForestDB KV(Key-Value) store configs. Note that multiple KV
  * store instances can be created in a single ForestDB file.
  * The general recommendation is to invoke this API to get the default configs
@@ -85,6 +102,18 @@ LIBFDB_API
 fdb_status fdb_open(fdb_file_handle **ptr_fhandle,
                     const char *filename,
                     fdb_config *fconfig);
+
+ /**
+  * Initialize and shut down wal preload workers. Doing it this way for 
+  * now for lack of a better way of initializing a new KV handle inside bgflusher.cc
+  */
+
+LIBFDB_API
+fdb_status fdb_init_workers(fdb_config *config, 
+                            fdb_kvs_config *kvs_config,
+                            const char* filename);
+LIBFDB_API
+fdb_status fdb_shutdown_workers();
 
 /**
  * Open a ForestDB file.
@@ -240,6 +269,22 @@ fdb_status fdb_get(fdb_kvs_handle *handle,
                    fdb_doc *doc);
 
 /**
+ * Retrieve the metadata and doc body for a given key.
+ * Note that FDB_DOC instance should be created by calling
+ * fdb_doc_create(doc, key, keylen, NULL, 0, NULL, 0) before using this API.
+ *
+ * @param handle Pointer to ForestDB KV store handle.
+ * @param doc Pointer to ForestDB doc instance whose metadata and doc body
+ *        are populated as a result of this API call.
+ * @return FDB_RESULT_SUCCESS on success.
+ */
+LIBFDB_API
+fdb_status fdb_get_async(fdb_kvs_handle *handle,
+                         fdb_doc *doc,
+                         user_fdb_async_get_cb_fn cb_fn,
+                         void* args);
+
+/**
  * Retrieve the metadata for a given key.
  * Note that FDB_DOC instance should be created by calling
  * fdb_doc_create(doc, key, keylen, NULL, 0, NULL, 0) before using this API.
@@ -324,6 +369,70 @@ fdb_status fdb_get_byoffset_raw(fdb_kvs_handle *handle,
                                 fdb_doc *doc);
 
 /**
+ * Store a raw key-value pair. Does not use a document abstraction.
+ *
+ * @param handle Pointer to ForestDB KV store handle.
+ * @param key Pointer to the key
+ * @param klen Length of the key
+ * @param value Pointer to the value
+ * @param vlen Length of the value
+ * @return FDB_RESULT_SUCCESS on success.
+ */
+LIBFDB_API
+fdb_status dotori_set(fdb_kvs_handle *handle,
+                      void* key, uint16_t klen,
+                      void* value, uint32_t vlen);
+
+/**
+ * Retrieve the value for a given key asynchronously.
+ *
+ * @param handle Pointer to ForestDB KV store handle.
+ * @param key Pointer to the key
+ * @param klen The length of the key
+ * @param value Pointer to the value. Will be allocated on-demand.
+ * @return FDB_RESULT_SUCCESS on success.
+ */
+LIBFDB_API
+fdb_status dotori_get_async(fdb_kvs_handle *handle,
+                            void* key, uint16_t klen,
+                            void** value, 
+                            user_fdb_async_get_cb_fn_nodoc cb_fn,
+                            void* args);
+
+LIBFDB_API
+fdb_status dotori_rmw_async(fdb_kvs_handle *handle,
+                            void* key, uint16_t klen,
+                            void** value, 
+                            user_fdb_async_get_cb_fn_nodoc cb_fn,
+                            void* args);
+
+/**
+ * Get the item from the iterator asynchronously.
+ *
+ * Example usage:
+ *   ...
+ *   void *value = NULL;
+ *   uint32_t valuelen_out;
+ *   fdb_status status = dotori_iterator_get_async(iterator, 
+ *                                                 &value, &valuelen_out,
+ *                                                 cb_fn, args);
+ *   ...
+ *   (in callback) free(value);
+ *
+ * @param iterator Pointer to the iterator.
+ * @param value Pointer to where the value will be allocated and copied
+ * @param valuelen_out Pointer to where the value length will be stored
+ * @param cb_fn Callback function to be executed after retrieving item
+ * @param voidargs Args to be passed to the callback function
+ * @return FDB_RESULT_SUCCESS on success.
+ */
+LIBFDB_API
+fdb_status dotori_iterator_get_async(fdb_iterator *iterator, 
+                                     void** value, uint32_t *valuelen_out,
+                                     user_fdb_async_get_cb_fn_nodoc cb_fn, 
+                                     void* voidargs);
+
+/**
  * Update the metadata and doc body for a given key.
  * Note that FDB_DOC instance should be created by calling
  * fdb_doc_create(doc, key, keylen, meta, metalen, body, bodylen) before using
@@ -368,6 +477,13 @@ LIBFDB_API
 fdb_status fdb_get_kv(fdb_kvs_handle *handle,
                       const void *key, size_t keylen,
                       void **value_out, size_t *valuelen_out);
+
+LIBFDB_API
+fdb_status fdb_get_kv_async(fdb_kvs_handle *handle,
+                            const void *key, size_t keylen,
+                            void **value_out, size_t *valuelen_out,
+                            user_fdb_async_get_cb_fn cb_fn,
+                            void *args);
 
 /**
  * Simplified API for fdb_set:
@@ -418,6 +534,9 @@ fdb_status fdb_free_block(void *ptr);
  */
 LIBFDB_API
 fdb_status fdb_commit(fdb_file_handle *fhandle, fdb_commit_opt_t opt);
+
+LIBFDB_API
+fdb_status fdb_compact_index(fdb_file_handle *fhandle);
 
 /**
  * Same as `fdb_commit`, but does not call `fsync` internally.
@@ -560,6 +679,49 @@ fdb_status fdb_iterator_prev(fdb_iterator *iterator);
  */
 LIBFDB_API
 fdb_status fdb_iterator_next(fdb_iterator *iterator);
+
+/**
+ * Get the item (key, metadata, doc body) from the iterator asynchronously.
+ * Note that the parameter 'doc' should be set to NULL before passing it
+ * to this API if the API caller wants a fdb_doc instance to be created and
+ * returned by this API.
+ *
+ * Example usage:
+ *   ...
+ *   fdb_doc *doc = NULL;
+ *   // fdb_doc instance is created and returned by fdb_iterator_get API.
+ *   fdb_status status = fdb_iterator_get_async(iterator, &doc, cb_fn, args);
+ *   ...
+ *   (in callback) fdb_doc_free(doc);
+ *
+ * Otherwise, if the client knows the max lengths of key, metadata, and
+ * value in the iterator range, then it can pre-allocate fdb_doc instance with
+ * these max lengths, and pass it to this API, so that the memory allocation
+ * overhead can be avoided for each iteration.
+ *
+ * Example usage:
+ *   ...
+ *   fdb_doc *doc;
+ *   fdb_doc_create(&doc, NULL, 0, NULL, 0, NULL, 0);
+ *   doc->key = malloc(MAX_KEY_LENGTH);
+ *   doc->meta = malloc(MAX_META_LENGTH);
+ *   doc->body = malloc(MAX_VALUE_LENGTH);
+ *   while (...) {
+ *       status = fdb_iterator_get(iterator, &doc);
+ *       ...
+ *   }
+ *   fdb_doc_free(doc);
+ *
+ * @param iterator Pointer to the iterator.
+ * @param doc Pointer to FDB_DOC instance to be populated by the iterator.
+ * @param cb_fn Callback function to be executed after retrieving item
+ * @param voidargs Args to be passed to the callback function
+ * @return FDB_RESULT_SUCCESS on success.
+ */
+LIBFDB_API
+fdb_status fdb_iterator_get_async(fdb_iterator *iterator, fdb_doc **doc,
+                                  user_fdb_async_get_cb_fn cb_fn, 
+                                  void* voidargs);
 
 /**
  * Get the item (key, metadata, doc body) from the iterator.
@@ -717,6 +879,46 @@ fdb_status fdb_compact(fdb_file_handle *fhandle,
                        const char *new_filename);
 
 /**
+ * Compact the current file and create a new compacted file.
+ * Note that a new file name passed to this API will be ignored if the compaction
+ * mode of the handle is auto-compaction (i.e., FDB_COMPACTION_AUTO). In the auto
+ * compaction mode, the name of a new compacted file will be automatically generated
+ * by increasing its current file revision number.
+ *
+ * If a new file name is not given (i.e., NULL is passed) in a manual compaction
+ * mode, then a new file name will be automatically created by appending
+ * a file revision number to the original file name.
+ *
+ *  Example usage:
+ *
+ *   fdb_open(db1, "test.fdb");
+ *   ...
+ *   fdb_compact(db1, NULL); // "test.fdb.1" is created after compaction.
+ *                           // Note that "test.fdb" will be removed automatically
+ *                           // when its reference counter becomes zero.
+ *   ...
+ *   fdb_compact(db1, NULL); // "test.fdb.2" is created after compaction.
+ *                           // Note that "test.fdb.1" will be removed automatically
+ *                           // when its reference counter becomes zero.
+ *   fdb_open(db2, "test.fdb"); // "test.fdb.2" is opened because that is the last
+ *                              // compacted file.
+ *   ...
+ *   fdb_close(db1);
+ *   fdb_close(db2); // "test.fdb.2" is automatically renamed to the original
+ *                   // file name "test.fdb" because there are no file handles
+ *                   // on "test.fdb.2".
+ *
+ * Also note that if a given ForestDB file is currently being compacted by the
+ * compaction daemon, then FDB_RESULT_FILE_IS_BUSY is returned to the caller.
+ *
+ * @param fhandle Pointer to ForestDB file handle.
+ * @param new_filename Name of a new compacted file.
+ * @return FDB_RESULT_SUCCESS on success.
+ */
+LIBFDB_API
+fdb_status fdb_compact_kvssd(fdb_file_handle *fhandle);
+
+/**
  * Do compaction with additional options.
  *
  * @param fhandle Pointer to ForestDB file handle.
@@ -773,6 +975,11 @@ LIBFDB_API
 fdb_status fdb_compact_upto(fdb_file_handle *fhandle,
                             const char *new_filename,
                             fdb_snapshot_marker_t marker);
+
+LIBFDB_API
+fdb_status fdb_compact_upto_kvssd(fdb_file_handle *fhandle,
+                            fdb_snapshot_marker_t marker);
+
 /**
  * Compact the database file by retaining the stale data upto a given file-level
  * snapshot marker and sharing valid document blocks from the old file.
@@ -840,6 +1047,9 @@ fdb_status fdb_rekey(fdb_file_handle *fhandle,
  */
 LIBFDB_API
 size_t fdb_get_buffer_cache_used();
+
+LIBFDB_API
+size_t fdb_get_kv_cache_used();
 
 /**
  * Return the overall disk space actively used by a ForestDB file.
@@ -1199,6 +1409,14 @@ LIBFDB_API
 int fdb_validate_files(size_t num_filenames,
                        const char** filenames);
 
+LIBFDB_API
+void fdb_print_stats();
+
+LIBFDB_API
+void fdb_get_stats(char* buf);
+
+LIBFDB_API
+void fdb_reset_stats();
 
 #ifdef __cplusplus
 }
